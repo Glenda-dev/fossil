@@ -1,0 +1,15 @@
+[package]
+name = "fossil"
+version = "0.1.0"
+edition = "2024"
+description = "Partition manager service for Glenda Microkernel"
+
+[dependencies]
+libglenda-rs = { path = "../../lib/libglenda-rs", features = ["rt-service"] }
+libglenda_drivers-rs = { path = "../../lib/libglenda_drivers-rs" }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", default-features = false, features = [
+    "derive",
+    "alloc",
+] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
