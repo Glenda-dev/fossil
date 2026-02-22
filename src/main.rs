@@ -7,17 +7,19 @@ mod utils;
 extern crate glenda;
 extern crate alloc;
 
+mod fossil;
 mod layout;
-mod manager;
-mod server;
 
-use glenda::cap::{CSPACE_CAP, CapType, Endpoint, MONITOR_CAP, RECV_SLOT, REPLY_SLOT};
-use glenda::client::ResourceClient;
+use crate::fossil::FossilServer;
+use crate::layout::{DEVICE_CAP, DEVICE_SLOT, INIT_CAP, INIT_SLOT};
+use glenda::cap::{
+    CSPACE_CAP, CapType, ENDPOINT_SLOT, Endpoint, MONITOR_CAP, RECV_SLOT, REPLY_SLOT,
+};
+use glenda::client::{DeviceClient, InitClient, ResourceClient};
 use glenda::interface::{ResourceService, SystemService};
-use glenda::protocol::resource::{DEVICE_ENDPOINT, ResourceType};
-use glenda::utils::manager::{CSpaceManager, CSpaceService};
-use manager::FossilManager;
-use server::FossilServer;
+use glenda::ipc::Badge;
+use glenda::protocol::resource::{DEVICE_ENDPOINT, INIT_ENDPOINT, ResourceType};
+use glenda::utils::manager::CSpaceManager;
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -25,30 +27,25 @@ fn main() {
     log!("Starting Fossil Partition Manager...");
 
     let mut res_client = ResourceClient::new(MONITOR_CAP);
-    let mut cspace = CSpaceManager::new(CSPACE_CAP, 64);
-
-    let ep_slot = cspace.alloc(&mut res_client).expect("Fossil: Failed to alloc endpoint slot");
     res_client
-        .alloc(glenda::ipc::Badge::null(), CapType::Endpoint, 0, ep_slot)
+        .get_cap(Badge::null(), ResourceType::Endpoint, INIT_ENDPOINT, INIT_SLOT)
+        .expect("Fossil: Failed to get init endpoint cap");
+    let mut init_client = InitClient::new(INIT_CAP);
+    let mut cspace = CSpaceManager::new(CSPACE_CAP, 16);
+
+    res_client
+        .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)
         .expect("Fossil: Failed to create endpoint cap");
-    let ep = Endpoint::from(ep_slot);
+    let ep = Endpoint::from(ENDPOINT_SLOT);
 
-    let device_ep_slot =
-        cspace.alloc(&mut res_client).expect("Fossil: Failed to alloc device_ep slot");
     res_client
-        .get_cap(
-            glenda::ipc::Badge::null(),
-            ResourceType::Endpoint,
-            DEVICE_ENDPOINT,
-            device_ep_slot,
-        )
-        .expect("Fossil: Failed to get Unicorn endpoint");
-    let device_ep = Endpoint::from(device_ep_slot);
-
-    let manager = FossilManager::new(device_ep);
+        .get_cap(Badge::null(), ResourceType::Endpoint, DEVICE_ENDPOINT, DEVICE_SLOT)
+        .expect("Fossil: Failed to get device endpoint cap");
+    let mut dev_client = DeviceClient::new(DEVICE_CAP);
 
     log!("Starting server loop...");
-    let mut server = FossilServer::new(ep, manager, &mut res_client, &mut cspace, device_ep);
+    let mut server =
+        FossilServer::new(ep, &mut res_client, &mut cspace, &mut dev_client, &mut init_client);
     server.init().expect("Fossil: Init failed");
     server.listen(ep, REPLY_SLOT, RECV_SLOT).expect("Fossil: Failed to listen");
     server.run().expect("Fossil: Server failed");
