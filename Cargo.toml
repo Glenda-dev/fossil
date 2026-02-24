@@ -2,7 +2,7 @@
 name = "fossil"
 version = "0.1.0"
 edition = "2024"
-description = "Partition manager service for Glenda Microkernel"
+description = "Volume manager service for Glenda Microkernel"
 
 [dependencies]
 libglenda-rs = { path = "../../lib/libglenda-rs", features = ["rt-service"] }

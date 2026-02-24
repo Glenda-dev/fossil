@@ -15,7 +15,7 @@ use crate::layout::{DEVICE_CAP, DEVICE_SLOT, INIT_CAP, INIT_SLOT};
 use glenda::cap::{
     CSPACE_CAP, CapType, ENDPOINT_SLOT, Endpoint, MONITOR_CAP, RECV_SLOT, REPLY_SLOT,
 };
-use glenda::client::{DeviceClient, InitClient, ResourceClient};
+use glenda::client::{DeviceClient, InitClient, ProcessClient, ResourceClient};
 use glenda::interface::{ResourceService, SystemService};
 use glenda::ipc::Badge;
 use glenda::protocol::resource::{DEVICE_ENDPOINT, INIT_ENDPOINT, ResourceType};
@@ -27,6 +27,7 @@ fn main() {
     log!("Starting Fossil Partition Manager...");
 
     let mut res_client = ResourceClient::new(MONITOR_CAP);
+    let mut process_client = ProcessClient::new(MONITOR_CAP);
     res_client
         .get_cap(Badge::null(), ResourceType::Endpoint, INIT_ENDPOINT, INIT_SLOT)
         .expect("Fossil: Failed to get init endpoint cap");
@@ -43,10 +44,29 @@ fn main() {
         .expect("Fossil: Failed to get device endpoint cap");
     let mut dev_client = DeviceClient::new(DEVICE_CAP);
 
+    // Register Fossil as VolumeService Provider
+    log!("Registering Fossil Volume Service...");
+    res_client
+        .register_cap(
+            Badge::null(),
+            ResourceType::Endpoint,
+            glenda::protocol::resource::VOLUME_ENDPOINT,
+            ENDPOINT_SLOT,
+        )
+        .ok();
+
     log!("Starting server loop...");
-    let mut server =
-        FossilServer::new(ep, &mut res_client, &mut cspace, &mut dev_client, &mut init_client);
-    server.init().expect("Fossil: Init failed");
+    let mut server = FossilServer::new(
+        ep,
+        &mut res_client,
+        &mut process_client,
+        &mut cspace,
+        &mut dev_client,
+        &mut init_client,
+    );
+    if let Err(e) = server.init() {
+        log!("Init failed: {:?}, trying to proceed...", e);
+    }
     server.listen(ep, REPLY_SLOT, RECV_SLOT).expect("Fossil: Failed to listen");
     server.run().expect("Fossil: Server failed");
 }
