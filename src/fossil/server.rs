@@ -59,7 +59,7 @@ impl<'a> SystemService for FossilServer<'a> {
         log!("Hooked to Unicorn for block devices");
         let target = HookTarget::Type(LogicDeviceType::RawBlock(0));
         let slot = self.cspace.alloc(self.res_client)?;
-        self.cspace.root().mint(self.endpoint.cap(), slot, Badge::new(0xf0511), Rights::ALL)?;
+        self.cspace.root().mint(self.endpoint.cap(), slot, Badge::null(), Rights::ALL)?;
         self.device_client.hook(Badge::null(), target, slot)?;
 
         // Register Volume endpoint with Warren
@@ -136,131 +136,100 @@ impl<'a> SystemService for FossilServer<'a> {
 
     fn dispatch(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
         glenda::ipc_dispatch! {
-                    self, utcb,
-                    (VOLUME_PROTO, glenda::protocol::volume::GET_DEVICE) => |s: &mut Self, u: &mut UTCB| {
-                         handle_cap_call(u, |u| {
-                            let badge_bits = u.get_mr(0);
-                            let requested_badge = if badge_bits == 0 { u.get_badge() } else { Badge::new(badge_bits) };
-                            let recv = u.get_recv_window();
-                            let ep = s.get_device(requested_badge, recv)?;
-                            Ok(ep.cap())
-                        })
-                    },
-                    (VOLUME_PROTO, glenda::protocol::volume::PROBE_DEVICE) => |s: &mut Self, u: &mut UTCB| {
-                        handle_call(u, |u| {
-                            let device_name = unsafe { u.read_str()? };
-                            s.probe_device(u.get_badge(), &device_name)?;
-                            Ok(())
-                        })
-                    },
-                    (VOLUME_PROTO, glenda::protocol::volume::MOUNT_PARTITION) => |s: &mut Self, u: &mut UTCB| {
-                       handle_call(u, |u| {
-                            let mut reader = unsafe { u.get_buffer_reader() };
-                            let partition_name = reader.read_str()?;
-                            let mount_point = reader.read_str()?;
-                            s.mount_partition(u.get_badge(), &partition_name, &mount_point)?;
-                            Ok(())
-                        })
-                    },
-                    (glenda::protocol::DEVICE_PROTO, glenda::protocol::device::NOTIFY_HOOK) => |s: &mut Self, u: &mut UTCB| {
-                        handle_notify(u, |_| {
-                            let res = s.sync_devices();
-                            if let Err(e) = res {
-                                log!("Device sync failed: {:?}", e);
-                            }
-                            Ok(())
-                        })?;
-                        Err(Error::Success)
-                    },
-                    (BLOCK_PROTO, block::NOTIFY_IO) => |s: &mut Self, u: &mut UTCB| {
-                        handle_notify(u, |u| {
-                            let badge = u.get_badge();
-                            if badge.bits() & 0x80000000 != 0 {
-                                // Hardware IO completion
-                                let hw_id = (badge.bits() & 0x7fffffff) as u64;
-                                if let Some(bclient) = s.device_clients.get(&(hw_id as usize)) {
-                                    if let Some(ring) = bclient.ring() {
-                                        while let Some(cqe) = ring.peek_completion() {
-                                            // Handle buffered request
-                                            // Remove from inflight map
-                                            if let Some(ctx) = s.inflight_requests.remove(&cqe.user_data) {
-                                                let mut res = cqe.res;
-                                                // Handle Buffering
-                                                if let Some(buf_info) = ctx.buffer_info {
-                                                    if cqe.res >= 0 {
-                                                        if !buf_info.is_write {
-                                                             // Read completion: Copy data to client
-                                                             // We need to find PID
-                                                             // Assuming we can map badge to PID
-                                                             // Reverse lookup is slow but functional
-                                                             // Logic for unaligned read completion (placeholder)
+            self, utcb,
+            (VOLUME_PROTO, glenda::protocol::volume::GET_DEVICE) => |s: &mut Self, u: &mut UTCB| {
+                 handle_cap_call(u, |u| {
+                    let badge_bits = u.get_mr(0);
+                    let requested_badge = if badge_bits == 0 { u.get_badge() } else { Badge::new(badge_bits) };
+                    let recv = u.get_recv_window();
+                    let ep = s.get_device(requested_badge, recv)?;
+                    Ok(ep.cap())
+                })
+            },
+            (VOLUME_PROTO, glenda::protocol::volume::PROBE_DEVICE) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let device_name = unsafe { u.read_str()? };
+                    s.probe_device(u.get_badge(), &device_name)?;
+                    Ok(())
+                })
+            },
+            (VOLUME_PROTO, glenda::protocol::volume::MOUNT_PARTITION) => |s: &mut Self, u: &mut UTCB| {
+               handle_call(u, |u| {
+                    let mut reader = unsafe { u.get_buffer_reader() };
+                    let partition_name = reader.read_str()?;
+                    let mount_point = reader.read_str()?;
+                    s.mount_partition(u.get_badge(), &partition_name, &mount_point)?;
+                    Ok(())
+                })
+            },
+            (glenda::protocol::KERNEL_PROTO, glenda::protocol::kernel::NOTIFY) => |s: &mut Self, u: &mut UTCB| {
+                handle_notify(u, |u| {
+                    let badge = u.get_badge();
+                    let bits = badge.bits();
+                    log!("Received notification with badge={:#x}", bits);
 
-        // Reverted write_vm logic pending new implementation
-                                                            // TODO: Implement copy from SHM to client buffer using new mechanism
-                                                        }
-                                                        res = buf_info.original_len as i32; // Report correct length
+                    // Determine flags
+                    let is_cq = bits & glenda::io::uring::NOTIFY_IO_URING_CQ != 0;
+                    let is_sq = bits & glenda::io::uring::NOTIFY_IO_URING_SQ != 0;
+                    let is_hook = bits & glenda::protocol::device::NOTIFY_HOOK != 0;
 
-                                                    }
-                                                }
-
-                                                if let Some(client_ring) = s.client_rings.get_mut(&ctx.client_badge) {
-                                                    let _ = client_ring.complete(ctx.client_user_data, res);
-                                                }
-                                            } else {
-                                                // Legacy path or untracked?
-                                                // log!("Untracked completion {}", cqe.user_data);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(())
-                        })?;
-                        Err(Error::Success)
-                    },
-                    (BLOCK_PROTO, block::GET_CAPACITY) => |s: &mut Self, u: &mut UTCB| {
-                        let badge = u.get_badge();
-                        handle_call(u, |_| {
-                            if let Some(partition) = s.partitions.get(&badge.bits()) {
-                                Ok(partition.meta.num_blocks as usize)
-                            } else {
-                                Err(Error::NotFound)
-                            }
-                        })
-                    },
-                    (BLOCK_PROTO, block::GET_BLOCK_SIZE) => |_, u: &mut UTCB| {
-                        handle_call(u, |_| Ok(4096usize))
-                    },
-                    (BLOCK_PROTO, block::SETUP_RING) => |s: &mut Self, u: &mut UTCB| {
-                        let badge = u.get_badge();
-                        handle_cap_call(u, |u| s.handle_setup_ring(u, badge))
-                    },
-                    (BLOCK_PROTO, block::SETUP_BUFFER) => |s: &mut Self, u: &mut UTCB| {
-                        handle_cap_call(u, |u| s.handle_request_buffer(u))
-                    },
-                    (BLOCK_PROTO, block::NOTIFY_SQ) => |s: &mut Self, u: &mut UTCB| {
-                        let badge = u.get_badge();
-                        handle_notify(u, |u| {
-                            let res=s.handle_notify_sq(u, badge);
-                            if let Err(e) = res {
-                                log!("Notify SQ failed: {:?} for badge {:?}", e, badge);
-                            }
-                            Ok(())
-                        })?;
-                        Err(Error::Success)
-                    },
-                    (_, _) => |_, u: &mut UTCB| {
-                        let tag = u.get_msg_tag();
-                        let badge = u.get_badge();
-                        error!(
-                            "Unhandled message (proto={:#x}, label={:#x}, badge={:?})",
-                            tag.proto(),
-                            tag.label(),
-                            badge
-                        );
-                        Err(Error::InvalidMethod)
+                    // 1. Check for device synchronization notifications
+                    if is_hook {
+                        if let Err(e) = s.handle_notify_sync() {
+                            log!("Fossil sync failed: {:?}", e);
+                        }
                     }
-                }
+
+                    // 2. Check for hardware IO completion notifications
+                    if is_cq {
+                        if let Err(e) = s.handle_notify_cq() {
+                            log!("Fossil hardware notify failed: {:?}", e);
+                        }
+                    }
+
+                    // 3. Check for client submission notifications
+                    if is_sq {
+                        if let Err(e) = s.handle_notify_sq() {
+                            log!("Fossil client notify failed: {:?}", e);
+                        }
+                    }
+
+                    Ok(())
+                })?;
+                Err(Error::Success)
+            },
+            (BLOCK_PROTO, block::GET_CAPACITY) => |s: &mut Self, u: &mut UTCB| {
+                let badge = u.get_badge();
+                handle_call(u, |_| {
+                    if let Some(partition) = s.partitions.get(&badge.bits()) {
+                        Ok(partition.meta.num_blocks as usize)
+                    } else {
+                        Err(Error::NotFound)
+                    }
+                })
+            },
+            (BLOCK_PROTO, block::GET_BLOCK_SIZE) => |_, u: &mut UTCB| {
+                handle_call(u, |_| Ok(4096usize))
+            },
+            (BLOCK_PROTO, block::SETUP_RING) => |s: &mut Self, u: &mut UTCB| {
+                let badge = u.get_badge();
+                handle_cap_call(u, |u| s.handle_setup_ring(u, badge))
+            },
+            (BLOCK_PROTO, block::SETUP_BUFFER) => |s: &mut Self, u: &mut UTCB| {
+                handle_cap_call(u, |u| s.handle_request_buffer(u))
+            },
+            (_, _) => |_, u: &mut UTCB| {
+                let tag = u.get_msg_tag();
+                let badge = u.get_badge();
+                error!(
+                    "Unhandled message (proto={:#x}, label={:#x}, badge={:?})",
+                    tag.proto(),
+                    tag.label(),
+                    badge
+                );
+                Err(Error::InvalidMethod)
+            }
+        }
     }
 
     fn reply(&mut self, utcb: &mut UTCB) -> Result<(), Error> {

@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Endpoint, Frame, Reply, Rights};
+use glenda::cap::{CapPtr, CapType, Endpoint, Frame, Reply, Rights};
 use glenda::client::{DeviceClient, InitClient, ProcessClient, ResourceClient};
 use glenda::error::Error;
 use glenda::interface::device::DeviceService;
@@ -277,7 +277,7 @@ impl<'a> FossilServer<'a> {
         self.cspace.root().mint(
             self.endpoint.cap(),
             hw_notify_slot,
-            Badge::new(hardware_id as usize | 0x80000000),
+            Badge::new(hardware_id as usize),
             Rights::ALL,
         )?;
         let hw_notify_ep = Endpoint::from(hw_notify_slot);
@@ -422,7 +422,7 @@ impl<'a> FossilServer<'a> {
         let sq_entries = utcb.get_mr(0) as u32;
         let cq_entries = utcb.get_mr(1) as u32;
 
-        log!("setup_ring(sq={}, cq={}, badge={:?})", sq_entries, cq_entries, badge);
+        log!("Setup_ring: sq={}, cq={}, badge={:?}", sq_entries, cq_entries, badge);
 
         if self.client_rings.contains_key(&badge.bits()) {
             return Err(Error::AlreadyExists);
@@ -437,8 +437,7 @@ impl<'a> FossilServer<'a> {
         let actual_size = pages * PGSIZE;
 
         let slot = self.cspace.alloc(self.res_client)?;
-        let frame_cap =
-            self.res_client.alloc(Badge::null(), glenda::cap::CapType::Frame, pages, slot)?;
+        let frame_cap = self.res_client.alloc(Badge::null(), CapType::Frame, pages, slot)?;
         let frame = Frame::from(frame_cap);
 
         let vaddr = self.next_ring_vaddr.fetch_add(actual_size, Ordering::SeqCst);
@@ -450,83 +449,122 @@ impl<'a> FossilServer<'a> {
         Ok(frame_cap)
     }
 
-    fn handle_notify_sq(
-        &mut self,
-        _utcb: &mut glenda::ipc::UTCB,
-        badge: Badge,
-    ) -> Result<(), Error> {
-        let ring = self.client_rings.get_mut(&badge.bits()).ok_or(Error::NotInitialized)?;
-        let proxy = self.partitions.get(&badge.bits()).ok_or(Error::NotFound)?;
-        let hw_id = proxy.meta.parent as usize;
-        let hw_client = self.device_clients.get(&hw_id).ok_or(Error::NotFound)?;
-        let hw_ring = hw_client.ring().ok_or(Error::NotInitialized)?;
+    fn handle_notify_sq(&mut self) -> Result<(), Error> {
+        let mut rings_to_process = Vec::new();
+        for badge in self.client_rings.keys() {
+            rings_to_process.push(*badge);
+        }
 
-        while let Some(mut sqe) = ring.ring.pop_sqe() {
-            proxy.translate_sqe(&mut sqe);
+        for badge_bits in rings_to_process {
+            let proxy = self.partitions.get(&badge_bits).ok_or(Error::NotFound)?;
+            let hw_id = proxy.meta.parent as usize;
+            let hw_client = self.device_clients.get(&hw_id).ok_or(Error::NotFound)?;
+            let hw_ring = hw_client.ring().ok_or(Error::NotInitialized)?;
 
-            let block_size = hw_client.block_size();
-            let hw_user_data = self.next_partition_badge.fetch_add(1, Ordering::Relaxed) as u64
-                | 0x8000000000000000;
+            let ring = self.client_rings.get_mut(&badge_bits).ok_or(Error::NotInitialized)?;
 
-            let client_user_data = sqe.user_data;
-            sqe.user_data = hw_user_data;
+            while let Some(mut sqe) = ring.ring.pop_sqe() {
+                proxy.translate_sqe(&mut sqe);
 
-            if buffer::IOBufferManager::is_aligned(&sqe, block_size) {
-                let ctx = buffer::RequestContext {
-                    client_badge: badge.bits(),
-                    client_user_data,
-                    buffer_info: None,
-                };
-                self.inflight_requests.insert(hw_user_data, ctx);
-                hw_ring.submit(sqe)?;
-            } else {
-                // Handle unaligned IO via Buffer Cache
-                let aligned_offset = sqe.off & !(block_size as u64 - 1);
-                let end_offset =
-                    (sqe.off + sqe.len as u64 + block_size as u64 - 1) & !(block_size as u64 - 1);
-                let aligned_len = (end_offset - aligned_offset) as u32; // Assuming fits in u32
+                let block_size = hw_client.block_size();
+                let hw_user_data = self.next_partition_badge.fetch_add(1, Ordering::Relaxed) as u64
+                    | 0x8000000000000000;
 
-                let sector_idx = aligned_offset / block_size as u64;
-                let cache_res = self.buffer_cache.access_block(hw_id, sector_idx);
+                let client_user_data = sqe.user_data;
+                sqe.user_data = hw_user_data;
 
-                let buffer_info = buffer::BufferInfo {
-                    original_addr: sqe.addr,
-                    original_len: sqe.len,
-                    original_offset: sqe.off,
-                    aligned_offset,
-                    aligned_len,
-                    is_write: sqe.opcode == glenda::io::uring::IOURING_OP_WRITE,
-                    cache_idx: Some(cache_res.block_idx),
-                };
-
-                let ctx = buffer::RequestContext {
-                    client_badge: badge.bits(),
-                    client_user_data,
-                    buffer_info: Some(buffer_info),
-                };
-
-                sqe.addr = cache_res.buf_vaddr as u64;
-                sqe.off = aligned_offset;
-                sqe.len = aligned_len;
-
-                self.inflight_requests.insert(hw_user_data, ctx);
-
-                if !cache_res.is_hit && !buffer_info.is_write {
-                    hw_ring.submit(sqe)?;
-                } else if buffer_info.is_write {
-                    // TODO: Handle write buffering/lazy write
+                if buffer::IOBufferManager::is_aligned(&sqe, block_size) {
+                    let ctx = buffer::RequestContext {
+                        client_badge: badge_bits,
+                        client_user_data,
+                        buffer_info: None,
+                    };
+                    self.inflight_requests.insert(hw_user_data, ctx);
                     hw_ring.submit(sqe)?;
                 } else {
-                    // Hit on Read, simulate complete or just re-read for now.
-                    // Ideally we just send completion to client ring immediately.
-                    // But structure of loop expects async completion.
-                    // We can submit a NOP or just complete?
-                    // Submit read anyway to verify hardware for now.
-                    hw_ring.submit(sqe)?;
+                    // Handle unaligned IO via Buffer Cache
+                    let aligned_offset = sqe.off & !(block_size as u64 - 1);
+                    let end_offset = (sqe.off + sqe.len as u64 + block_size as u64 - 1)
+                        & !(block_size as u64 - 1);
+                    let aligned_len = (end_offset - aligned_offset) as u32; // Assuming fits in u32
+
+                    let sector_idx = aligned_offset / block_size as u64;
+                    let cache_res = self.buffer_cache.access_block(hw_id, sector_idx);
+
+                    let buffer_info = buffer::BufferInfo {
+                        original_addr: sqe.addr,
+                        original_len: sqe.len,
+                        original_offset: sqe.off,
+                        aligned_offset,
+                        aligned_len,
+                        is_write: sqe.opcode == glenda::io::uring::IOURING_OP_WRITE,
+                        cache_idx: Some(cache_res.block_idx),
+                    };
+
+                    let ctx = buffer::RequestContext {
+                        client_badge: badge_bits,
+                        client_user_data,
+                        buffer_info: Some(buffer_info),
+                    };
+
+                    sqe.addr = cache_res.buf_vaddr as u64;
+                    sqe.off = aligned_offset;
+                    sqe.len = aligned_len;
+
+                    self.inflight_requests.insert(hw_user_data, ctx);
+
+                    if !cache_res.is_hit && !buffer_info.is_write {
+                        hw_ring.submit(sqe)?;
+                    } else if buffer_info.is_write {
+                        // TODO: Handle write buffering/lazy write
+                        hw_ring.submit(sqe)?;
+                    } else {
+                        // Hit on Read, simulate complete or just re-read for now.
+                        hw_ring.submit(sqe)?;
+                    }
                 }
             }
         }
+        Ok(())
+    }
 
+    pub fn handle_notify_sync(&mut self) -> Result<(), Error> {
+        self.sync_devices()
+    }
+
+    pub fn handle_notify_cq(&mut self) -> Result<(), Error> {
+        let mut hardware_processed = Vec::new();
+        for hw_id in self.device_clients.keys() {
+            hardware_processed.push(*hw_id);
+        }
+
+        for hw_id in hardware_processed {
+            if let Some(bclient) = self.device_clients.get(&hw_id) {
+                if let Some(ring) = bclient.ring() {
+                    while let Some(cqe) = ring.peek_completion() {
+                        // Handle buffered request
+                        if let Some(ctx) = self.inflight_requests.remove(&cqe.user_data) {
+                            let mut res = cqe.res;
+                            // Handle Buffering
+                            if let Some(buf_info) = ctx.buffer_info {
+                                if cqe.res >= 0 {
+                                    if !buf_info.is_write {
+                                        // Read completion: Copy data to client
+                                        // Logic for unaligned read completion should be here
+                                    }
+                                    res = buf_info.original_len as i32;
+                                }
+                            }
+
+                            if let Some(client_ring) = self.client_rings.get_mut(&ctx.client_badge)
+                            {
+                                let _ = client_ring.complete(ctx.client_user_data, res);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }
