@@ -166,7 +166,6 @@ impl<'a> SystemService for FossilServer<'a> {
                 handle_notify(u, |u| {
                     let badge = u.get_badge();
                     let bits = badge.bits();
-                    log!("Received notification with badge={:#x}", bits);
 
                     // Determine flags
                     let is_cq = bits & glenda::io::uring::NOTIFY_IO_URING_CQ != 0;
