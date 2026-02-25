@@ -175,21 +175,21 @@ impl<'a> SystemService for FossilServer<'a> {
                     // 1. Check for device synchronization notifications
                     if is_hook {
                         if let Err(e) = s.handle_notify_sync() {
-                            log!("Fossil sync failed: {:?}", e);
+                            log!("Sync failed: {:?}", e);
                         }
                     }
 
                     // 2. Check for hardware IO completion notifications
                     if is_cq {
                         if let Err(e) = s.handle_notify_cq() {
-                            log!("Fossil hardware notify failed: {:?}", e);
+                            log!("Hardware notify failed: {:?}", e);
                         }
                     }
 
                     // 3. Check for client submission notifications
                     if is_sq {
                         if let Err(e) = s.handle_notify_sq() {
-                            log!("Fossil client notify failed: {:?}", e);
+                            log!("Client notify failed: {:?}", e);
                         }
                     }
 
