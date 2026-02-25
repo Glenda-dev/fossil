@@ -390,7 +390,7 @@ impl<'a> FossilServer<'a> {
                                 self.driver_to_partition.insert(pid, badge.bits());
                             }
                             Err(e) => {
-                                error!("Fossil: Failed to spawn driver {}: {:?}", driver.name, e);
+                                error!("Failed to spawn driver {}: {:?}", driver.name, e);
                             }
                         }
                     }
