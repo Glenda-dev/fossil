@@ -10,7 +10,6 @@ use glenda::protocol::VOLUME_PROTO;
 use glenda::protocol::device::{HookTarget, LogicDeviceType};
 use glenda::protocol::init::ServiceState;
 use glenda::utils::manager::CSpaceService;
-use glenda_drivers::protocol::{BLOCK_PROTO, block};
 
 impl<'a> SystemService for FossilServer<'a> {
     fn init(&mut self) -> Result<(), Error> {
@@ -57,7 +56,7 @@ impl<'a> SystemService for FossilServer<'a> {
         // Register hook for future devices
 
         log!("Hooked to Unicorn for block devices");
-        let target = HookTarget::Type(LogicDeviceType::RawBlock(0));
+        let target = HookTarget::Type(LogicDeviceType::Block);
         let slot = self.cspace.alloc(self.res_client)?;
         self.cspace.root().mint(self.endpoint.cap(), slot, Badge::null(), Rights::ALL)?;
         self.device_client.hook(Badge::null(), target, slot)?;
@@ -163,11 +162,33 @@ impl<'a> SystemService for FossilServer<'a> {
                     Ok(())
                 })
             },
+            (VOLUME_PROTO, glenda::protocol::volume::GET_INFO) => |s: &mut Self, u: &mut UTCB| {
+                let badge = u.get_badge();
+                handle_call(u, |u| {
+                    if let Some(partition) = s.partitions.get(&badge.bits()) {
+                        u.set_mr(0, partition.meta.block_size as usize); // block_size
+                        u.set_mr(1, partition.meta.num_blocks as usize); // size in blocks
+                        Ok(())
+                    } else {
+                        Err(Error::NotFound)
+                    }
+                })
+            },
+            (VOLUME_PROTO, glenda::protocol::volume::SETUP_RING) => |s: &mut Self, u: &mut UTCB| {
+                let badge = u.get_badge();
+                handle_cap_call(u, |u| s.handle_setup_ring(u, badge))
+            },
+            (VOLUME_PROTO, glenda::protocol::volume::ACQUIRE_SHM) => |s: &mut Self, u: &mut UTCB| {
+                handle_cap_call(u, |u| s.handle_acquire_shm(u))
+            },
+            (VOLUME_PROTO, glenda::protocol::volume::REGISTER_SHM) => |s: &mut Self, u: &mut UTCB| {
+                let badge = u.get_badge();
+                handle_call(u, |u| s.handle_register_shm(u, badge).map(|_| 0usize))
+            },
             (glenda::protocol::KERNEL_PROTO, glenda::protocol::kernel::NOTIFY) => |s: &mut Self, u: &mut UTCB| {
                 handle_notify(u, |u| {
                     let badge = u.get_badge();
                     let bits = badge.bits();
-
                     // Determine flags
                     let is_cq = bits & glenda::io::uring::NOTIFY_IO_URING_CQ != 0;
                     let is_sq = bits & glenda::io::uring::NOTIFY_IO_URING_SQ != 0;
@@ -197,26 +218,6 @@ impl<'a> SystemService for FossilServer<'a> {
                     Ok(())
                 })?;
                 Err(Error::Success)
-            },
-            (BLOCK_PROTO, block::GET_CAPACITY) => |s: &mut Self, u: &mut UTCB| {
-                let badge = u.get_badge();
-                handle_call(u, |_| {
-                    if let Some(partition) = s.partitions.get(&badge.bits()) {
-                        Ok(partition.meta.num_blocks as usize)
-                    } else {
-                        Err(Error::NotFound)
-                    }
-                })
-            },
-            (BLOCK_PROTO, block::GET_BLOCK_SIZE) => |_, u: &mut UTCB| {
-                handle_call(u, |_| Ok(4096usize))
-            },
-            (BLOCK_PROTO, block::SETUP_RING) => |s: &mut Self, u: &mut UTCB| {
-                let badge = u.get_badge();
-                handle_cap_call(u, |u| s.handle_setup_ring(u, badge))
-            },
-            (BLOCK_PROTO, block::SETUP_BUFFER) => |s: &mut Self, u: &mut UTCB| {
-                handle_cap_call(u, |u| s.handle_request_buffer(u))
             },
             (_, _) => |_, u: &mut UTCB| {
                 let tag = u.get_msg_tag();
