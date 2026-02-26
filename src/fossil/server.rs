@@ -96,6 +96,7 @@ impl<'a> SystemService for FossilServer<'a> {
             let mut utcb = unsafe { UTCB::new() };
             utcb.clear();
 
+            // FIXME: 执行清理
             if !self.recv.is_null() {
                 let _ = self.cspace.root().delete(self.recv);
             }
@@ -104,7 +105,7 @@ impl<'a> SystemService for FossilServer<'a> {
             utcb.set_recv_window(self.recv);
 
             if let Err(e) = self.endpoint.recv(&mut utcb) {
-                log!("Recv error: {:?}", e);
+                error!("Recv error: {:?}", e);
                 continue;
             }
 
@@ -118,7 +119,7 @@ impl<'a> SystemService for FossilServer<'a> {
                 Err(e) => {
                     let badge = utcb.get_badge();
                     let tag = utcb.get_msg_tag();
-                    log!(
+                    error!(
                         "Dispatch error: {:?} badge={}, proto={:#x}, label={:#x}",
                         e,
                         badge,
