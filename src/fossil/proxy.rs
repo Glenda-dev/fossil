@@ -3,10 +3,9 @@ use crate::fossil::{FossilServer, buffer};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
-use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, CapType, Endpoint, Frame};
+use glenda::cap::{CapPtr, Endpoint};
+use glenda::mem::pool::ShmType;
 use glenda::error::Error;
-use glenda::interface::{MemoryService, ResourceService};
 use glenda::io::uring::{
     IOURING_OP_WRITE, IoUringBuffer as IoUring, IoUringServer, IoUringSqe as SQE,
 };
@@ -49,11 +48,11 @@ impl PartitionProxy {
 
 impl<'a> FossilServer<'a> {
     pub fn handle_acquire_shm(&mut self, utcb: &mut UTCB) -> Result<CapPtr, Error> {
-        if let Some((frame, vaddr, size, _)) = &self.shm_frame {
-            utcb.set_mr(0, *vaddr);
-            utcb.set_mr(1, *size);
+        if let Some(shm) = &self.global_shm {
+            utcb.set_mr(0, shm.vaddr());
+            utcb.set_mr(1, shm.size());
             // DO NOT set MR2 - physical address is hidden from VolumeClient
-            Ok(frame.cap())
+            Ok(shm.frame().cap())
         } else {
             Err(Error::NotInitialized)
         }
@@ -63,13 +62,15 @@ impl<'a> FossilServer<'a> {
         let client_vaddr = utcb.get_mr(0);
         let client_size = utcb.get_mr(1);
 
-        if let Some((frame, _, _, paddr)) = &self.shm_frame {
+        if let Some(shm) = &self.global_shm {
+            // For VolumeClient (like InitrdFS), we explicitly hide the physical address
+            // to ensure isolation. The proxy translates addresses to Fossil's view.
             self.client_shms.insert(
                 badge.bits(),
                 ShmParams {
-                    frame: frame.clone(),
+                    frame: shm.frame().clone(),
                     vaddr: client_vaddr,
-                    paddr: *paddr as u64, // Use system-managed physical address
+                    paddr: 0, // Shielded for non-hardware clients
                     size: client_size,
                     recv_slot: CapPtr::null(),
                 },
@@ -92,20 +93,20 @@ impl<'a> FossilServer<'a> {
         let notify_ep = Endpoint::from(notify_slot);
 
         let ring_size = 64 + (sq_entries as usize * 64) + (cq_entries as usize * 16);
-        let pages = (ring_size + PGSIZE - 1) / PGSIZE;
-        let actual_size = pages * PGSIZE;
-
+        
         let slot = self.cspace.alloc(self.res_client)?;
-        let frame_cap = self.res_client.alloc(Badge::null(), CapType::Frame, pages, slot)?;
-        let frame = Frame::from(frame_cap);
+        let shm = self.mem_pool.alloc_shm(
+            self.res_client,
+            ring_size,
+            ShmType::Regular,
+            slot
+        )?;
 
-        let vaddr = self.next_ring_vaddr.fetch_add(actual_size, Ordering::SeqCst);
-        self.res_client.mmap(Badge::null(), frame, vaddr, actual_size)?;
-        let ring = unsafe { IoUring::new(vaddr as *mut u8, actual_size, sq_entries, cq_entries) };
+        let ring = unsafe { IoUring::new(shm.vaddr() as *mut u8, shm.size(), sq_entries, cq_entries) };
         let mut server = IoUringServer::new(ring);
         server.set_client_notify(notify_ep);
         self.client_rings.insert(badge.bits(), server);
-        Ok(frame_cap)
+        Ok(shm.frame().cap())
     }
 
     pub fn handle_notify_sq(&mut self) -> Result<(), Error> {
@@ -126,8 +127,8 @@ impl<'a> FossilServer<'a> {
                     let addr = sqe.addr as usize;
                     if addr >= shm.vaddr && addr < shm.vaddr + shm.size {
                         let offset = addr - shm.vaddr;
-                        if let Some((_, server_va, _, _)) = &self.shm_frame {
-                            sqe.addr = (server_va + offset) as u64;
+                        if let Some(gshm) = &self.global_shm {
+                            sqe.addr = (gshm.vaddr() + offset) as u64;
                         }
                     }
                 }

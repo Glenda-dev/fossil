@@ -1,4 +1,4 @@
-pub const PROBE_VADDR: usize = 0x5000_0000;
+pub const PROBE_VADDR: usize = glenda::mem::SERVICE_POOL_VA;
 pub const RING_ENTRIES: u32 = 4;
 
 use glenda::cap::{CapPtr, Endpoint};

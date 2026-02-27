@@ -2,7 +2,7 @@ use super::FossilServer;
 use glenda::cap::{CapPtr, Endpoint, Reply, Rights};
 use glenda::error::Error;
 use glenda::interface::{
-    DeviceService, InitService, MemoryService, ResourceService, SystemService, VolumeService,
+    DeviceService, InitService, ResourceService, SystemService, VolumeService,
 };
 use glenda::ipc::server::{handle_call, handle_cap_call, handle_notify};
 use glenda::ipc::{Badge, MsgTag, UTCB};
@@ -18,16 +18,17 @@ impl<'a> SystemService for FossilServer<'a> {
         let config_slot = self.cspace.alloc(self.res_client)?;
         match self.res_client.get_config(Badge::null(), "fs.json", config_slot) {
             Ok((frame, size)) => {
-                let vaddr = self
-                    .next_ring_vaddr
-                    .fetch_add((size + 4095) & !4095, core::sync::atomic::Ordering::SeqCst);
-                if let Ok(_) = self.res_client.mmap(Badge::null(), frame, vaddr, size) {
-                    let data = unsafe { core::slice::from_raw_parts(vaddr as *const u8, size) };
+                if let Ok(shm) = self.mem_pool.map_shm(self.res_client, frame, size, glenda::mem::Perms::READ) {
+                    let data = unsafe { core::slice::from_raw_parts(shm.vaddr() as *const u8, shm.size()) };
                     if let Ok(config) = serde_json::from_slice::<super::FSConfig>(data) {
                         log!("Loaded {} FS drivers from config", config.filesystems.len());
                         self.fs_config = Some(config);
                     }
                 }
+                // Update mem_pool next_vaddr since we manually mmapped
+                // Actually, config mapping is temporary, we just use it for parsing.
+                // But it's better to use mem_pool for everything.
+
                 // Clean up the frame cap from CSpace after use to avoid clutter
                 let _ = self.cspace.root().delete(config_slot);
             }
@@ -40,18 +41,13 @@ impl<'a> SystemService for FossilServer<'a> {
         // Initialize Global Buffer Cache SHM
         let shm_size = self.fs_config.as_ref().map(|c| c.buffer_size).unwrap_or(2 * 1024 * 1024);
         log!("Initializing Buffer Cache ({} bytes)...", shm_size);
-        let shm_pages = shm_size / 4096;
-        let shm_slot = self.cspace.alloc(self.res_client)?;
-        // Use dma_alloc to get physically contiguous (if needed) or just frames.
-        // Assuming dma_alloc allocates contiguous memory which is good for drivers.
-        let (shm_paddr, shm_frame) =
-            self.res_client.dma_alloc(Badge::null(), shm_pages, shm_slot)?;
-        let shm_vaddr =
-            self.next_ring_vaddr.fetch_add(shm_size, core::sync::atomic::Ordering::SeqCst);
-        self.res_client.mmap(Badge::null(), shm_frame.clone(), shm_vaddr, shm_size)?;
 
-        self.buffer_cache = super::buffer::BufferCache::new(shm_vaddr, shm_size, 4096);
-        self.shm_frame = Some((shm_frame, shm_vaddr, shm_size, shm_paddr));
+        let shm_slot = self.cspace.alloc(self.res_client)?;
+        let shm =
+            self.mem_pool.alloc_shm(self.res_client, shm_size, super::ShmType::DMA, shm_slot)?;
+
+        self.buffer_cache = super::buffer::BufferCache::new(shm.vaddr(), shm.size(), 4096);
+        self.global_shm = Some(shm);
 
         // Register hook for future devices
 

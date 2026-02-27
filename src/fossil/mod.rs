@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Endpoint, Reply};
+use glenda::cap::{CapPtr, Endpoint, Frame, Reply};
 use glenda::client::{DeviceClient, InitClient, ProcessClient, ResourceClient};
 use glenda::error::Error;
 use glenda::interface::ProcessService;
@@ -29,6 +29,8 @@ mod volume;
 
 use alloc::collections::VecDeque;
 pub use buffer::RequestContext;
+use glenda::mem::pool::{MemoryPool, ShmType};
+use glenda::mem::shm::SharedMemory;
 pub use proxy::{PartitionMetadata, PartitionProxy};
 
 pub struct FossilServer<'a> {
@@ -53,14 +55,14 @@ pub struct FossilServer<'a> {
     pub fs_config: Option<FSConfig>,
     pub driver_to_partition: BTreeMap<usize, usize>,
     pub next_partition_badge: AtomicUsize,
-    pub next_ring_vaddr: AtomicUsize,
+    pub mem_pool: MemoryPool,
     pub running: bool,
 
     pub pending_devices: VecDeque<String>,
 
     // Block Cache
     pub buffer_cache: buffer::BufferCache,
-    pub shm_frame: Option<(glenda::cap::Frame, usize, usize, usize)>, // Frame, vaddr, size, paddr
+    pub global_shm: Option<SharedMemory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,11 +113,11 @@ impl<'a> FossilServer<'a> {
             fs_config: None,
             driver_to_partition: BTreeMap::new(),
             next_partition_badge: AtomicUsize::new(0x1000),
-            next_ring_vaddr: AtomicUsize::new(PROBE_VADDR + PGSIZE * 512),
+            mem_pool: MemoryPool::new(PROBE_VADDR + PGSIZE * 512),
             running: false,
             pending_devices: VecDeque::new(),
             buffer_cache: buffer::BufferCache::new(0, 0, 4096),
-            shm_frame: None,
+            global_shm: None,
         }
     }
 
@@ -247,11 +249,10 @@ impl<'a> FossilServer<'a> {
         log!("Probing device {} (hw_id={:x})", desc.name, hardware_id);
 
         // Setup ring for AIO probing
-        let ring_vaddr = self.next_ring_vaddr.fetch_add(PGSIZE, Ordering::SeqCst);
         let ring_slot = self.cspace.alloc(self.res_client)?;
+        let ring_vaddr = self.mem_pool.reserve(PGSIZE);
 
-        let (shm_frame, shm_va, shm_sz, shm_pa) =
-            self.shm_frame.as_ref().ok_or(Error::NotInitialized)?;
+        let gshm = self.global_shm.as_ref().ok_or(Error::NotInitialized)?;
         let mut client = BlockClient::new(
             hardware_ep,
             self.res_client,
@@ -264,15 +265,24 @@ impl<'a> FossilServer<'a> {
                 size: PGSIZE,
             },
             ShmParams {
-                frame: *shm_frame,
-                vaddr: *shm_va,
-                paddr: *shm_pa as u64,
-                size: *shm_sz,
+                frame: gshm.frame(),
+                vaddr: gshm.vaddr(),
+                paddr: gshm.paddr(),
+                size: gshm.size(),
                 recv_slot: CapPtr::null(),
             },
         );
 
         client.connect()?;
+
+        // Add the received ring frame to MemoryPool for tracking
+        self.mem_pool.map_shm(
+            self.res_client,
+            Frame::from(ring_slot),
+            PGSIZE,
+            glenda::mem::Perms::READ | glenda::mem::Perms::WRITE,
+        )?;
+
         let block_size = client.block_size() as usize;
         let mut buf = [0u8; 4096]; // Buffer for at least one block
         client.read_blocks(0, 1, &mut buf[..block_size])?;
