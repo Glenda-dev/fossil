@@ -1,5 +1,6 @@
 use super::FossilServer;
-use glenda::cap::{CapPtr, Endpoint, Reply, Rights};
+use crate::FSConfig;
+use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::{
     DeviceService, InitService, ResourceService, SystemService, VolumeService,
@@ -15,26 +16,13 @@ impl<'a> SystemService for FossilServer<'a> {
     fn init(&mut self) -> Result<(), Error> {
         // Load Filesystem Driver Config (fs.json)
         log!("Loading fs.json...");
-        let config_slot = self.cspace.alloc(self.res_client)?;
-        match self.res_client.get_config(Badge::null(), "fs.json", config_slot) {
-            Ok((frame, size)) => {
-                if let Ok(shm) = self.mem_pool.map_shm(self.res_client, frame, size, glenda::mem::Perms::READ) {
-                    let data = unsafe { core::slice::from_raw_parts(shm.vaddr() as *const u8, shm.size()) };
-                    if let Ok(config) = serde_json::from_slice::<super::FSConfig>(data) {
-                        log!("Loaded {} FS drivers from config", config.filesystems.len());
-                        self.fs_config = Some(config);
-                    }
-                }
-                // Update mem_pool next_vaddr since we manually mmapped
-                // Actually, config mapping is temporary, we just use it for parsing.
-                // But it's better to use mem_pool for everything.
-
-                // Clean up the frame cap from CSpace after use to avoid clutter
-                let _ = self.cspace.root().delete(config_slot);
+        match FSConfig::load(self.res_client, self.cspace, &mut self.mem_pool) {
+            Ok(config) => {
+                log!("Loaded {} FS drivers from config", config.filesystems.len());
+                self.fs_config = Some(config);
             }
             Err(_) => {
                 log!("No fs.json found or failed to load");
-                let _ = self.cspace.root().delete(config_slot);
             }
         }
 
@@ -47,15 +35,29 @@ impl<'a> SystemService for FossilServer<'a> {
             self.mem_pool.alloc_shm(self.res_client, shm_size, super::ShmType::DMA, shm_slot)?;
 
         self.buffer_cache = super::buffer::BufferCache::new(shm.vaddr(), shm.size(), 4096);
+
+        if let Some(ref config) = self.fs_config {
+            if config.replacement_policy == "fifo" {
+                // Future implementation
+            } else if config.replacement_policy == "lru" {
+                self.buffer_cache.set_policy(alloc::boxed::Box::new(crate::policy::LruPolicy));
+            }
+
+            if config.write_policy == "write-through" {
+                self.buffer_cache
+                    .set_write_policy(alloc::boxed::Box::new(crate::policy::WriteThrough));
+            } else if config.write_policy == "write-back" {
+                // Future implementation
+            }
+        }
+
         self.global_shm = Some(shm);
 
         // Register hook for future devices
 
         log!("Hooked to Unicorn for block devices");
         let target = HookTarget::Type(LogicDeviceType::Block);
-        let slot = self.cspace.alloc(self.res_client)?;
-        self.cspace.root().mint(self.endpoint.cap(), slot, Badge::null(), Rights::ALL)?;
-        self.device_client.hook(Badge::null(), target, slot)?;
+        self.device_client.hook(Badge::null(), target, self.endpoint.cap())?;
 
         // Register Volume endpoint with Warren
         log!("Registering Volume Service...");
@@ -131,7 +133,7 @@ impl<'a> SystemService for FossilServer<'a> {
     }
 
     fn dispatch(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
-        glenda::ipc_dispatch! {
+        let result = glenda::ipc_dispatch! {
             self, utcb,
             (VOLUME_PROTO, glenda::protocol::volume::GET_DEVICE) => |s: &mut Self, u: &mut UTCB| {
                  handle_cap_call(u, |u| {
@@ -193,27 +195,26 @@ impl<'a> SystemService for FossilServer<'a> {
                     // 1. Check for device synchronization notifications
                     if is_hook {
                         if let Err(e) = s.handle_notify_sync() {
-                            log!("Sync failed: {:?}", e);
+                            error!("Sync failed: {:?}", e);
                         }
                     }
 
                     // 2. Check for hardware IO completion notifications
                     if is_cq {
                         if let Err(e) = s.handle_notify_cq() {
-                            log!("Hardware notify failed: {:?}", e);
+                            error!("Hardware notify failed: {:?}", e);
                         }
                     }
 
                     // 3. Check for client submission notifications
                     if is_sq {
                         if let Err(e) = s.handle_notify_sq() {
-                            log!("Client notify failed: {:?}", e);
+                            error!("Client notify failed: {:?}", e);
                         }
                     }
 
                     Ok(())
-                })?;
-                Err(Error::Success)
+                })
             },
             (_, _) => |_, u: &mut UTCB| {
                 let tag = u.get_msg_tag();
@@ -226,7 +227,8 @@ impl<'a> SystemService for FossilServer<'a> {
                 );
                 Err(Error::InvalidMethod)
             }
-        }
+        };
+        result
     }
 
     fn reply(&mut self, utcb: &mut UTCB) -> Result<(), Error> {

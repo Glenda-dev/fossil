@@ -2,16 +2,16 @@
 #![allow(dead_code)]
 #![no_main]
 
+mod config;
+mod fossil;
+mod layout;
+mod policy;
 mod utils;
+
 #[macro_use]
 extern crate glenda;
 extern crate alloc;
 
-mod fossil;
-mod layout;
-
-use crate::fossil::FossilServer;
-use crate::layout::{DEVICE_CAP, DEVICE_SLOT, INIT_CAP, INIT_SLOT};
 use glenda::cap::{
     CSPACE_CAP, CapType, ENDPOINT_SLOT, Endpoint, MONITOR_CAP, RECV_SLOT, REPLY_SLOT,
 };
@@ -20,6 +20,10 @@ use glenda::interface::{ResourceService, SystemService};
 use glenda::ipc::Badge;
 use glenda::protocol::resource::{DEVICE_ENDPOINT, INIT_ENDPOINT, ResourceType};
 use glenda::utils::manager::CSpaceManager;
+use layout::{DEVICE_CAP, DEVICE_SLOT, INIT_CAP, INIT_SLOT};
+
+pub use config::FSConfig;
+pub use fossil::FossilServer;
 
 #[unsafe(no_mangle)]
 fn main() {
@@ -64,9 +68,7 @@ fn main() {
         &mut dev_client,
         &mut init_client,
     );
-    if let Err(e) = server.init() {
-        log!("Init failed: {:?}, trying to proceed...", e);
-    }
     server.listen(ep, REPLY_SLOT, RECV_SLOT).expect("Fossil: Failed to listen");
+    server.init().expect("Fossil: Failed to initialize server");
     server.run().expect("Fossil: Server failed");
 }

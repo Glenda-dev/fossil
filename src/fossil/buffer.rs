@@ -1,3 +1,4 @@
+use crate::policy::{LruPolicy, ReplacementPolicy, WritePolicy, WriteThrough};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -9,6 +10,7 @@ pub enum BlockState {
     Invalid,
     Valid,
     Dirty,
+    Filling,
 }
 
 #[derive(Debug, Clone)]
@@ -18,30 +20,6 @@ pub struct CacheBlock {
     pub state: BlockState,
     pub buf_offset: usize, // Offset in the global buffer
     pub last_access: u64,  // For LRU
-}
-
-pub trait ReplacementPolicy: Send + Sync {
-    fn on_access(&mut self, block_idx: usize);
-    fn select_evict(&self, blocks: &[CacheBlock]) -> usize;
-}
-
-pub struct LruPolicy;
-
-impl ReplacementPolicy for LruPolicy {
-    fn on_access(&mut self, _block_idx: usize) {}
-
-    fn select_evict(&self, blocks: &[CacheBlock]) -> usize {
-        let mut lru_idx = 0;
-        let mut min_access = u64::MAX;
-
-        for (i, block) in blocks.iter().enumerate() {
-            if block.last_access < min_access {
-                min_access = block.last_access;
-                lru_idx = i;
-            }
-        }
-        lru_idx
-    }
 }
 
 pub struct BufferCache {
@@ -55,6 +33,7 @@ pub struct BufferCache {
     lookup: BTreeMap<(usize, u64), usize>,
     free_blocks: Vec<usize>,
     policy: Box<dyn ReplacementPolicy>,
+    write_policy: Box<dyn WritePolicy>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,11 +71,24 @@ impl BufferCache {
             lookup: BTreeMap::new(),
             free_blocks,
             policy: Box::new(LruPolicy),
+            write_policy: Box::new(WriteThrough),
         }
     }
 
     pub fn set_policy(&mut self, policy: Box<dyn ReplacementPolicy>) {
         self.policy = policy;
+    }
+
+    pub fn set_write_policy(&mut self, policy: Box<dyn WritePolicy>) {
+        self.write_policy = policy;
+    }
+
+    pub fn should_write_through(&self, idx: usize) -> bool {
+        self.write_policy.should_write_through(&self.blocks[idx])
+    }
+
+    pub fn needs_flush_on_evict(&self, idx: usize) -> bool {
+        self.write_policy.needs_flush_on_evict(&self.blocks[idx])
     }
 
     pub fn get_block_size(&self) -> usize {
@@ -112,7 +104,12 @@ impl BufferCache {
     pub fn access_block(&mut self, device_id: usize, sector_idx: u64) -> CacheResult {
         let access_time = self.access_counter.fetch_add(1, Ordering::SeqCst) as u64;
 
-        if let Some(&idx) = self.lookup.get(&(device_id, sector_idx)) {
+        // Standardize on 4KB alignment for cache indexing.
+        // A "sector" in BufferCache is now a 4KB unit.
+        // Any sub-4KB sector device will be handled by grouping sectors.
+        let cache_sector_idx = sector_idx & !7; // Group 8x 512B sectors into one 4KB block
+
+        if let Some(&idx) = self.lookup.get(&(device_id, cache_sector_idx)) {
             // Cache Hit
             let block = &mut self.blocks[idx];
             block.last_access = access_time;
@@ -150,11 +147,11 @@ impl BufferCache {
         // Initialize new block
         let block = &mut self.blocks[idx];
         block.device_id = device_id;
-        block.sector_idx = sector_idx;
+        block.sector_idx = cache_sector_idx;
         block.state = BlockState::Invalid; // Caller must fill it
         block.last_access = access_time;
 
-        self.lookup.insert((device_id, sector_idx), idx);
+        self.lookup.insert((device_id, cache_sector_idx), idx);
         self.policy.on_access(idx);
 
         CacheResult {
@@ -208,6 +205,7 @@ pub struct BufferInfo {
     pub aligned_offset: u64,
     pub aligned_len: u32,
     pub is_write: bool,           // true if write op
+    pub is_rmw: bool,             // true if needs RMW
     pub cache_idx: Option<usize>, // Track associated cache block
 }
 

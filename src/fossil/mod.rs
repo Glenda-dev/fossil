@@ -1,6 +1,8 @@
+use crate::FSConfig;
 use crate::layout::PROBE_VADDR;
 use crate::utils::gpt::{GPTHeader, GPTPartition};
 use crate::utils::mbr::MBR;
+use alloc::collections::VecDeque;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -13,24 +15,21 @@ use glenda::interface::ProcessService;
 use glenda::interface::device::DeviceService;
 use glenda::io::uring::IoUringServer;
 use glenda::ipc::Badge;
+use glenda::mem::pool::{MemoryPool, ShmType};
+use glenda::mem::shm::SharedMemory;
 use glenda::protocol::device::LogicDeviceType;
-use glenda::utils::align::align_up;
 use glenda::utils::manager::{CSpaceManager, CSpaceService};
 use glenda_drivers::client::block::BlockClient;
 use glenda_drivers::client::{RingParams, ShmParams};
 use glenda_drivers::interface::{BlockDriver, DriverClient};
-use serde::{Deserialize, Serialize};
 
 mod buffer;
 mod proxy;
 mod server;
-pub mod sniffer;
+mod sniffer;
 mod volume;
 
-use alloc::collections::VecDeque;
-pub use buffer::RequestContext;
-use glenda::mem::pool::{MemoryPool, ShmType};
-use glenda::mem::shm::SharedMemory;
+pub use buffer::{CacheBlock, RequestContext};
 pub use proxy::{PartitionMetadata, PartitionProxy};
 
 pub struct FossilServer<'a> {
@@ -63,26 +62,6 @@ pub struct FossilServer<'a> {
     // Block Cache
     pub buffer_cache: buffer::BufferCache,
     pub global_shm: Option<SharedMemory>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FSDriverConfig {
-    pub name: String,
-    pub binary: String,
-    pub compatible: Vec<String>,
-    #[serde(default)]
-    pub autostart: bool,
-}
-
-fn default_buffer_size() -> usize {
-    2 * 1024 * 1024
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FSConfig {
-    #[serde(default = "default_buffer_size")]
-    pub buffer_size: usize,
-    pub filesystems: Vec<FSDriverConfig>,
 }
 
 impl<'a> FossilServer<'a> {
@@ -240,58 +219,93 @@ impl<'a> FossilServer<'a> {
         Ok(())
     }
 
-    pub fn probe(
+    fn read_block(
+        &mut self,
+        client: &BlockClient,
+        hw_id: usize,
+        lba: u64,
+        target: &mut [u8],
+    ) -> Result<(), Error> {
+        let block_size = client.block_size() as usize;
+        let res = self.buffer_cache.access_block(hw_id, lba);
+        let cache_vaddr = res.buf_vaddr;
+
+        if !res.is_hit {
+            // Read from device into cache
+            let cache_slice =
+                unsafe { core::slice::from_raw_parts_mut(cache_vaddr as *mut u8, block_size) };
+            client.read_blocks(lba, 1, cache_slice)?;
+            self.buffer_cache.mark_valid(res.block_idx);
+        }
+
+        let cache_slice =
+            unsafe { core::slice::from_raw_parts(cache_vaddr as *const u8, block_size) };
+        let copy_len = core::cmp::min(target.len(), block_size);
+        target[..copy_len].copy_from_slice(&cache_slice[..copy_len]);
+        Ok(())
+    }
+
+    fn probe(
         &mut self,
         hardware_id: u64,
         desc: glenda::protocol::device::LogicDeviceDesc,
         hardware_ep: Endpoint,
     ) -> Result<(), Error> {
-        log!("Probing device {} (hw_id={:x})", desc.name, hardware_id);
-
-        // Setup ring for AIO probing
+        log!("Probing device {} (ID: {})", desc.name, hardware_id);
+        let gshm = self.global_shm.as_ref().ok_or(Error::NotInitialized)?;
         let ring_slot = self.cspace.alloc(self.res_client)?;
         let ring_vaddr = self.mem_pool.reserve(PGSIZE);
 
-        let gshm = self.global_shm.as_ref().ok_or(Error::NotInitialized)?;
-        let mut client = BlockClient::new(
-            hardware_ep,
-            self.res_client,
-            RingParams {
-                sq_entries: 4,
-                cq_entries: 4,
-                notify_ep: self.endpoint,
-                recv_slot: ring_slot,
-                vaddr: ring_vaddr,
-                size: PGSIZE,
-            },
-            ShmParams {
-                frame: gshm.frame(),
-                vaddr: gshm.vaddr(),
-                paddr: gshm.paddr(),
-                size: gshm.size(),
-                recv_slot: CapPtr::null(),
-            },
-        );
-
-        client.connect()?;
-
-        // Add the received ring frame to MemoryPool for tracking
-        self.mem_pool.map_shm(
-            self.res_client,
-            Frame::from(ring_slot),
-            PGSIZE,
-            glenda::mem::Perms::READ | glenda::mem::Perms::WRITE,
-        )?;
+        let client = {
+            if let Some(existing) = self.device_clients.get(&(hardware_id as usize)) {
+                existing.clone()
+            } else {
+                let mut c = BlockClient::new(
+                    hardware_ep,
+                    self.res_client,
+                    RingParams {
+                        sq_entries: 4,
+                        cq_entries: 4,
+                        notify_ep: self.endpoint,
+                        recv_slot: ring_slot,
+                        vaddr: ring_vaddr,
+                        size: PGSIZE,
+                    },
+                    ShmParams {
+                        frame: gshm.frame(),
+                        vaddr: gshm.vaddr(),
+                        paddr: gshm.paddr(),
+                        size: gshm.size(),
+                        recv_slot: CapPtr::null(),
+                    },
+                );
+                c.connect()?;
+                // Add the received ring frame to MemoryPool for tracking
+                self.mem_pool.map_shm(
+                    self.res_client,
+                    Frame::from(ring_slot),
+                    PGSIZE,
+                    glenda::mem::Perms::READ | glenda::mem::Perms::WRITE,
+                )?;
+                c
+            }
+        };
 
         let block_size = client.block_size() as usize;
-        let mut buf = [0u8; 4096]; // Buffer for at least one block
-        client.read_blocks(0, 1, &mut buf[..block_size])?;
+        let hw_id_usize = hardware_id as usize;
+        let mut first_block = [0u8; 4096];
+        self.read_block(&client, hw_id_usize, 0, &mut first_block[..block_size])?;
+
         log!("Read first block of device {} for partition probing", desc.name);
-        let mut partitions =
-            self.probe_partitions(&desc, &buf[..block_size], block_size, |lba, target| {
-                let count = align_up(target.len(), block_size) / block_size;
-                client.read_blocks(lba, count as u32, target)
-            });
+
+        let mut partitions = {
+            let server_ptr = core::cell::UnsafeCell::new(&mut *self);
+            let s = unsafe { &*server_ptr.get() };
+            s.probe_partitions(&desc, &first_block[..block_size], block_size, |lba, target| {
+                let s_mut = unsafe { &mut *server_ptr.get() };
+                s_mut.read_block(&client, hw_id_usize, lba, target)
+            })
+        };
 
         // Fallback: If no partition table found, treat the whole device as one partition
         if partitions.is_empty() {
@@ -324,24 +338,27 @@ impl<'a> FossilServer<'a> {
             };
 
             // Sniff FS
-            let fs_type = sniffer::detect_fs(|offset, target| {
-                let sector = first_lba + offset / block_size as u64;
-                let offset_in_sector = offset % block_size as u64;
+            let fs_type = {
+                let s_ptr = core::cell::UnsafeCell::new(&mut *self);
+                sniffer::detect_fs(|offset, target| {
+                    let s = unsafe { &mut *s_ptr.get() };
+                    let sector = first_lba + offset / block_size as u64;
+                    let offset_in_sector = offset % block_size as u64;
 
-                if offset_in_sector == 0 && target.len() >= block_size {
-                    let count = (target.len() + block_size - 1) / block_size;
-                    client.read_blocks(sector, count as u32, target)
-                } else {
-                    let mut temp = [0u8; 4096];
-                    client.read_blocks(sector, 1, &mut temp[..block_size])?;
-                    let copy_len =
-                        core::cmp::min(target.len(), block_size - offset_in_sector as usize);
-                    target[..copy_len].copy_from_slice(
-                        &temp[offset_in_sector as usize..offset_in_sector as usize + copy_len],
-                    );
-                    Ok(())
-                }
-            });
+                    if offset_in_sector == 0 && target.len() >= block_size {
+                        s.read_block(&client, hw_id_usize, sector, target)
+                    } else {
+                        let mut temp = [0u8; 4096];
+                        s.read_block(&client, hw_id_usize, sector, &mut temp[..block_size])?;
+                        let copy_len =
+                            core::cmp::min(target.len(), block_size - offset_in_sector as usize);
+                        target[..copy_len].copy_from_slice(
+                            &temp[offset_in_sector as usize..offset_in_sector as usize + copy_len],
+                        );
+                        Ok(())
+                    }
+                })
+            };
             log!("Partition {} FS type: {:?}", p_desc.name, fs_type);
 
             let proxy =
