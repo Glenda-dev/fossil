@@ -6,6 +6,7 @@ use alloc::collections::VecDeque;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
+use glenda::mem::Perms;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use glenda::arch::mem::PGSIZE;
 use glenda::cap::{CapPtr, Endpoint, Frame, Reply};
@@ -18,7 +19,8 @@ use glenda::ipc::Badge;
 use glenda::mem::pool::{MemoryPool, ShmType};
 use glenda::mem::shm::SharedMemory;
 use glenda::protocol::device::LogicDeviceType;
-use glenda::utils::manager::{CSpaceManager, CSpaceService};
+use glenda::interface::CSpaceService;
+use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use glenda_drivers::client::block::BlockClient;
 use glenda_drivers::client::{RingParams, ShmParams};
 use glenda_drivers::interface::{BlockDriver, DriverClient};
@@ -40,6 +42,7 @@ pub struct FossilServer<'a> {
     pub device_client: &'a mut DeviceClient,
     pub process_client: &'a mut ProcessClient,
     pub cspace: &'a mut CSpaceManager,
+    pub vspace: &'a mut VSpaceManager,
     pub init_client: &'a mut InitClient,
 
     pub partitions: BTreeMap<usize, PartitionProxy>,
@@ -70,6 +73,7 @@ impl<'a> FossilServer<'a> {
         res_client: &'a mut ResourceClient,
         process_client: &'a mut ProcessClient,
         cspace: &'a mut CSpaceManager,
+        vspace: &'a mut VSpaceManager,
         device_client: &'a mut DeviceClient,
         init_client: &'a mut InitClient,
     ) -> Self {
@@ -82,6 +86,7 @@ impl<'a> FossilServer<'a> {
             device_client,
             init_client,
             cspace,
+            vspace,
             partitions: BTreeMap::new(),
             name_to_badge: BTreeMap::new(),
             client_rings: BTreeMap::new(),
@@ -157,7 +162,7 @@ impl<'a> FossilServer<'a> {
                                     results.push((
                                         desc,
                                         part.first_lba,
-                                        (part.last_lba - part.first_lba + 1),
+                                        part.last_lba - part.first_lba + 1,
                                     ));
                                     part_index += 1;
                                 }
@@ -279,13 +284,15 @@ impl<'a> FossilServer<'a> {
                         recv_slot: CapPtr::null(),
                     },
                 );
-                c.connect()?;
+                c.connect(self.vspace, self.cspace)?;
                 // Add the received ring frame to MemoryPool for tracking
                 self.mem_pool.map_shm(
+                    self.vspace,
+                    self.cspace,
                     self.res_client,
                     Frame::from(ring_slot),
                     PGSIZE,
-                    glenda::mem::Perms::READ | glenda::mem::Perms::WRITE,
+                    Perms::READ | Perms::WRITE,
                 )?;
                 c
             }

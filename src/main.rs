@@ -19,7 +19,7 @@ use glenda::client::{DeviceClient, InitClient, ProcessClient, ResourceClient};
 use glenda::interface::{ResourceService, SystemService};
 use glenda::ipc::Badge;
 use glenda::protocol::resource::{DEVICE_ENDPOINT, INIT_ENDPOINT, ResourceType};
-use glenda::utils::manager::CSpaceManager;
+use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 use layout::{DEVICE_CAP, DEVICE_SLOT, INIT_CAP, INIT_SLOT};
 
 pub use config::FSConfig;
@@ -37,6 +37,7 @@ fn main() {
         .expect("Fossil: Failed to get init endpoint cap");
     let mut init_client = InitClient::new(INIT_CAP);
     let mut cspace = CSpaceManager::new(CSPACE_CAP, 16);
+    let mut vspace = VSpaceManager::new(glenda::cap::VSPACE_CAP, 0x7000_0000, 0x8000_0000);
 
     res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)
@@ -65,6 +66,7 @@ fn main() {
         &mut res_client,
         &mut process_client,
         &mut cspace,
+        &mut vspace,
         &mut dev_client,
         &mut init_client,
     );

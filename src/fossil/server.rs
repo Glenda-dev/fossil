@@ -2,6 +2,7 @@ use super::FossilServer;
 use crate::FSConfig;
 use glenda::cap::{CapPtr, Endpoint, Reply};
 use glenda::error::Error;
+use glenda::interface::CSpaceService;
 use glenda::interface::{
     DeviceService, InitService, ResourceService, SystemService, VolumeService,
 };
@@ -10,13 +11,12 @@ use glenda::ipc::{Badge, MsgTag, UTCB};
 use glenda::protocol::VOLUME_PROTO;
 use glenda::protocol::device::{HookTarget, LogicDeviceType};
 use glenda::protocol::init::ServiceState;
-use glenda::utils::manager::CSpaceService;
 
 impl<'a> SystemService for FossilServer<'a> {
     fn init(&mut self) -> Result<(), Error> {
         // Load Filesystem Driver Config (fs.json)
         log!("Loading fs.json...");
-        match FSConfig::load(self.res_client, self.cspace, &mut self.mem_pool) {
+        match FSConfig::load(self.res_client, self.cspace, self.vspace, &mut self.mem_pool) {
             Ok(config) => {
                 log!("Loaded {} FS drivers from config", config.filesystems.len());
                 self.fs_config = Some(config);
@@ -31,8 +31,14 @@ impl<'a> SystemService for FossilServer<'a> {
         log!("Initializing Buffer Cache ({} bytes)...", shm_size);
 
         let shm_slot = self.cspace.alloc(self.res_client)?;
-        let shm =
-            self.mem_pool.alloc_shm(self.res_client, shm_size, super::ShmType::DMA, shm_slot)?;
+        let shm = self.mem_pool.alloc_shm(
+            self.vspace,
+            self.cspace,
+            self.res_client,
+            shm_size,
+            super::ShmType::DMA,
+            shm_slot,
+        )?;
 
         self.buffer_cache = super::buffer::BufferCache::new(shm.vaddr(), shm.size(), 4096);
 
@@ -92,11 +98,6 @@ impl<'a> SystemService for FossilServer<'a> {
 
             let mut utcb = unsafe { UTCB::new() };
             utcb.clear();
-
-            // FIXME: 执行清理
-            if !self.recv.is_null() {
-                let _ = self.cspace.root().delete(self.recv);
-            }
 
             utcb.set_reply_window(self.reply.cap());
             utcb.set_recv_window(self.recv);
