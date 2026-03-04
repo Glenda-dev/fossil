@@ -11,7 +11,7 @@ use glenda::io::uring::{
 };
 use glenda::ipc::{Badge, UTCB};
 use glenda::mem::pool::ShmType;
-use glenda_drivers::client::ShmParams;
+use glenda::drivers::client::ShmParams;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

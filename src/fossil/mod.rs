@@ -21,9 +21,9 @@ use glenda::mem::shm::SharedMemory;
 use glenda::protocol::device::LogicDeviceType;
 use glenda::interface::CSpaceService;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
-use glenda_drivers::client::block::BlockClient;
-use glenda_drivers::client::{RingParams, ShmParams};
-use glenda_drivers::interface::{BlockDriver, DriverClient};
+use glenda::drivers::client::block::BlockClient;
+use glenda::drivers::client::{RingParams, ShmParams};
+use glenda::drivers::interface::{BlockDriver, DriverClient};
 
 mod buffer;
 mod proxy;
