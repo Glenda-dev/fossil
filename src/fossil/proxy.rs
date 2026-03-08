@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint};
+use glenda::drivers::client::ShmParams;
 use glenda::error::Error;
 use glenda::interface::CSpaceService;
 use glenda::io::uring::{
@@ -11,7 +12,6 @@ use glenda::io::uring::{
 };
 use glenda::ipc::{Badge, UTCB};
 use glenda::mem::pool::ShmType;
-use glenda::drivers::client::ShmParams;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,7 +234,7 @@ impl<'a> FossilServer<'a> {
         for hw_id in hardware_ids {
             if let Some(bclient) = self.device_clients.get(&hw_id) {
                 if let Some(ring) = bclient.ring() {
-                    while let Some(cqe) = ring.peek_completion() {
+                    while let Some(cqe) = ring.pop_completion() {
                         if let Some(ctx) = self.inflight_requests.remove(&cqe.user_data) {
                             let mut res = cqe.res;
                             if let Some(buf_info) = ctx.buffer_info {

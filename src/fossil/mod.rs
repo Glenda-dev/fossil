@@ -6,24 +6,24 @@ use alloc::collections::VecDeque;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
-use glenda::mem::Perms;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Endpoint, Frame, Reply};
+use glenda::cap::{CapPtr, Endpoint, Frame, Reply, TCB};
 use glenda::client::{DeviceClient, InitClient, ProcessClient, ResourceClient};
+use glenda::drivers::client::block::BlockClient;
+use glenda::drivers::client::{RingParams, ShmParams};
+use glenda::drivers::interface::{BlockDriver, DriverClient};
 use glenda::error::Error;
+use glenda::interface::CSpaceService;
 use glenda::interface::ProcessService;
 use glenda::interface::device::DeviceService;
 use glenda::io::uring::IoUringServer;
 use glenda::ipc::Badge;
+use glenda::mem::Perms;
 use glenda::mem::pool::{MemoryPool, ShmType};
 use glenda::mem::shm::SharedMemory;
 use glenda::protocol::device::LogicDeviceType;
-use glenda::interface::CSpaceService;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
-use glenda::drivers::client::block::BlockClient;
-use glenda::drivers::client::{RingParams, ShmParams};
-use glenda::drivers::interface::{BlockDriver, DriverClient};
 
 mod buffer;
 mod proxy;
@@ -61,6 +61,7 @@ pub struct FossilServer<'a> {
     pub running: bool,
 
     pub pending_devices: VecDeque<String>,
+    pub probe_tcb: Option<TCB>,
 
     // Block Cache
     pub buffer_cache: buffer::BufferCache,
@@ -100,6 +101,7 @@ impl<'a> FossilServer<'a> {
             mem_pool: MemoryPool::new(PROBE_VADDR + PGSIZE * 512),
             running: false,
             pending_devices: VecDeque::new(),
+            probe_tcb: None,
             buffer_cache: buffer::BufferCache::new(0, 0, 4096),
             global_shm: None,
         }
@@ -202,6 +204,9 @@ impl<'a> FossilServer<'a> {
                 self.pending_devices.push_back(name);
             }
         }
+        if let Some(tcb) = self.probe_tcb {
+            tcb.resume().ok();
+        }
         Ok(())
     }
 
@@ -220,6 +225,9 @@ impl<'a> FossilServer<'a> {
                     self.probe(hw_id, desc, hw_ep)?;
                 }
             }
+        }
+        if let Some(tcb) = self.probe_tcb {
+            tcb.suspend().ok();
         }
         Ok(())
     }
@@ -298,12 +306,11 @@ impl<'a> FossilServer<'a> {
             }
         };
 
+        log!("Read first block of device {} for partition probing", desc.name);
         let block_size = client.block_size() as usize;
         let hw_id_usize = hardware_id as usize;
         let mut first_block = [0u8; 4096];
         self.read_block(&client, hw_id_usize, 0, &mut first_block[..block_size])?;
-
-        log!("Read first block of device {} for partition probing", desc.name);
 
         let mut partitions = {
             let server_ptr = core::cell::UnsafeCell::new(&mut *self);
