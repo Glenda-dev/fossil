@@ -16,9 +16,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartitionMetadata {
-    pub parent: u64,
-    pub start_lba: u64,
-    pub num_blocks: u64,
+    pub parent: usize,
+    pub start_lba: usize,
+    pub num_blocks: usize,
     pub block_size: u32,
 }
 
@@ -131,13 +131,13 @@ impl<'a> FossilServer<'a> {
                     if addr >= shm.vaddr && addr < shm.vaddr + shm.size {
                         let offset = addr - shm.vaddr;
                         if let Some(gshm) = &self.global_shm {
-                            sqe.addr = (gshm.vaddr() + offset) as u64;
+                            sqe.addr = (gshm.vaddr() + offset) as usize;
                         }
                     }
                 }
 
-                let hw_user_data = self.next_partition_badge.fetch_add(1, Ordering::Relaxed) as u64
-                    | 0x8000000000000000;
+                let hw_user_data = self.next_partition_badge.fetch_add(1, Ordering::Relaxed) as usize
+                    | (1_usize << (usize::BITS - 1));
 
                 let client_user_data = sqe.user_data;
                 sqe.user_data = hw_user_data;
@@ -151,8 +151,8 @@ impl<'a> FossilServer<'a> {
                     self.inflight_requests.insert(hw_user_data, ctx);
                     hw_ring.submit(sqe)?;
                 } else {
-                    let aligned_offset = sqe.off & !7u64; // Aligned to 4KB (8 sectors)
-                    let end_offset = (sqe.off + (sqe.len as u64 + 511) / 512 + 7) & !7u64;
+                    let aligned_offset = sqe.off & !7usize; // Aligned to 4KB (8 sectors)
+                    let end_offset = (sqe.off + (sqe.len as usize + 511) / 512 + 7) & !7usize;
                     let aligned_len_sectors = (end_offset - aligned_offset) as u32;
 
                     let cache_res = self.buffer_cache.access_block(hw_id, aligned_offset);
@@ -176,7 +176,7 @@ impl<'a> FossilServer<'a> {
                         buffer_info: Some(buffer_info),
                     };
 
-                    sqe.addr = cache_res.buf_vaddr as u64;
+                    sqe.addr = cache_res.buf_vaddr as usize;
                     sqe.off = aligned_offset;
                     sqe.len = aligned_len_sectors * 512;
 
@@ -328,8 +328,8 @@ impl<'a> FossilServer<'a> {
                                                         let hw_user_data = self
                                                             .next_partition_badge
                                                             .fetch_add(1, Ordering::Relaxed)
-                                                            as u64
-                                                            | 0x8000000000000000;
+                                                            as usize
+                                                            | (1_usize << (usize::BITS - 1));
 
                                                         let mut sqe =
                                                             glenda::io::uring::IoUringSqe::default(
@@ -339,7 +339,7 @@ impl<'a> FossilServer<'a> {
                                                         sqe.addr =
                                                             (self.buffer_cache.get_base_vaddr()
                                                                 + cidx * 4096)
-                                                                as u64;
+                                                                as usize;
                                                         sqe.off = buf_info.aligned_offset;
                                                         sqe.len = buf_info.aligned_len;
                                                         sqe.user_data = hw_user_data;

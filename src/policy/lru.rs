@@ -8,7 +8,7 @@ impl ReplacementPolicy for LruPolicy {
 
     fn select_evict(&self, blocks: &[CacheBlock]) -> usize {
         let mut lru_idx = 0;
-        let mut min_access = u64::MAX;
+        let mut min_access = usize::MAX;
 
         for (i, block) in blocks.iter().enumerate() {
             if block.last_access < min_access {

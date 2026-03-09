@@ -50,9 +50,9 @@ pub struct FossilServer<'a> {
     pub client_rings: BTreeMap<usize, IoUringServer>,
     pub client_shms: BTreeMap<usize, ShmParams>,
     pub device_clients: BTreeMap<usize, BlockClient>,
-    pub probed_hardware: BTreeSet<u64>,
+    pub probed_hardware: BTreeSet<usize>,
 
-    pub inflight_requests: BTreeMap<u64, RequestContext>,
+    pub inflight_requests: BTreeMap<usize, RequestContext>,
 
     pub fs_config: Option<FSConfig>,
     pub driver_to_partition: BTreeMap<usize, usize>,
@@ -113,9 +113,9 @@ impl<'a> FossilServer<'a> {
         sector0: &[u8],
         block_size: usize,
         mut read_fn: F,
-    ) -> Vec<(glenda::protocol::device::LogicDeviceDesc, u64, u64)>
+    ) -> Vec<(glenda::protocol::device::LogicDeviceDesc, usize, usize)>
     where
-        F: FnMut(u64, &mut [u8]) -> Result<(), Error>,
+        F: FnMut(usize, &mut [u8]) -> Result<(), Error>,
     {
         let mut results = Vec::new();
 
@@ -142,7 +142,7 @@ impl<'a> FossilServer<'a> {
                             * header.partition_entry_size as usize;
                         let entries_blk_count = (entries_len + block_size - 1) / block_size;
                         if let Ok(_) = read_fn(
-                            header.partition_entry_lba,
+                            header.partition_entry_lba as usize,
                             &mut entries_buf[..entries_blk_count * block_size],
                         ) {
                             let gpt_parts = GPTPartition::parse_entries(
@@ -163,8 +163,8 @@ impl<'a> FossilServer<'a> {
                                     };
                                     results.push((
                                         desc,
-                                        part.first_lba,
-                                        part.last_lba - part.first_lba + 1,
+                                        part.first_lba as usize,
+                                        ((part.last_lba - part.first_lba) as usize + 1),
                                     ));
                                     part_index += 1;
                                 }
@@ -182,7 +182,7 @@ impl<'a> FossilServer<'a> {
                             parent_name: parent_desc.name.clone(),
                             badge: None,
                         };
-                        results.push((desc, entry.start_lba as u64, entry.sectors_count as u64));
+                        results.push((desc, entry.start_lba as usize, entry.sectors_count as usize));
                         p_index += 1;
                     }
                 }
@@ -236,7 +236,7 @@ impl<'a> FossilServer<'a> {
         &mut self,
         client: &BlockClient,
         hw_id: usize,
-        lba: u64,
+        lba: usize,
         target: &mut [u8],
     ) -> Result<(), Error> {
         let block_size = client.block_size() as usize;
@@ -260,7 +260,7 @@ impl<'a> FossilServer<'a> {
 
     fn probe(
         &mut self,
-        hardware_id: u64,
+        hardware_id: usize,
         desc: glenda::protocol::device::LogicDeviceDesc,
         hardware_ep: Endpoint,
     ) -> Result<(), Error> {
@@ -331,7 +331,7 @@ impl<'a> FossilServer<'a> {
                     badge: None,
                 },
                 0,
-                client.total_sectors(),
+                client.total_sectors() as usize,
             ));
         }
 
@@ -356,8 +356,8 @@ impl<'a> FossilServer<'a> {
                 let s_ptr = core::cell::UnsafeCell::new(&mut *self);
                 sniffer::detect_fs(|offset, target| {
                     let s = unsafe { &mut *s_ptr.get() };
-                    let sector = first_lba + offset / block_size as u64;
-                    let offset_in_sector = offset % block_size as u64;
+                    let sector = first_lba + offset / block_size as usize;
+                    let offset_in_sector = offset % block_size as usize;
 
                     if offset_in_sector == 0 && target.len() >= block_size {
                         s.read_block(&client, hw_id_usize, sector, target)

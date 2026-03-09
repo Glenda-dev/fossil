@@ -16,10 +16,10 @@ pub enum BlockState {
 #[derive(Debug, Clone)]
 pub struct CacheBlock {
     pub device_id: usize,
-    pub sector_idx: u64,
+    pub sector_idx: usize,
     pub state: BlockState,
     pub buf_offset: usize, // Offset in the global buffer
-    pub last_access: u64,  // For LRU
+    pub last_access: usize,  // For LRU
 }
 
 pub struct BufferCache {
@@ -30,7 +30,7 @@ pub struct BufferCache {
     blocks: Vec<CacheBlock>,
     access_counter: AtomicUsize,
     // Map (device_id, sector_idx) -> block_index
-    lookup: BTreeMap<(usize, u64), usize>,
+    lookup: BTreeMap<(usize, usize), usize>,
     free_blocks: Vec<usize>,
     policy: Box<dyn ReplacementPolicy>,
     write_policy: Box<dyn WritePolicy>,
@@ -101,8 +101,8 @@ impl BufferCache {
 
     /// Access a block. If present, returns index and update LRU.
     /// If absent, evict LRU or use free block, return index.
-    pub fn access_block(&mut self, device_id: usize, sector_idx: u64) -> CacheResult {
-        let access_time = self.access_counter.fetch_add(1, Ordering::SeqCst) as u64;
+    pub fn access_block(&mut self, device_id: usize, sector_idx: usize) -> CacheResult {
+        let access_time = self.access_counter.fetch_add(1, Ordering::SeqCst) as usize;
 
         // Standardize on 4KB alignment for cache indexing.
         // A "sector" in BufferCache is now a 4KB unit.
@@ -191,7 +191,7 @@ pub struct IOBufferManager;
 impl IOBufferManager {
     /// Checks if the request is aligned to the block_size.
     pub fn is_aligned(sqe: &IoUringSqe, block_size: u32) -> bool {
-        (sqe.off % block_size as u64 == 0) && (sqe.len % block_size == 0)
+        (sqe.off % block_size as usize == 0) && (sqe.len % block_size == 0)
     }
 
     // Moved check_alignment_and_create_context logic to Server
@@ -199,10 +199,10 @@ impl IOBufferManager {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BufferInfo {
-    pub original_addr: u64,
+    pub original_addr: usize,
     pub original_len: u32,
-    pub original_offset: u64,
-    pub aligned_offset: u64,
+    pub original_offset: usize,
+    pub aligned_offset: usize,
     pub aligned_len: u32,
     pub is_write: bool,           // true if write op
     pub is_rmw: bool,             // true if needs RMW
@@ -211,6 +211,6 @@ pub struct BufferInfo {
 
 pub struct RequestContext {
     pub client_badge: usize,
-    pub client_user_data: u64,
+    pub client_user_data: usize,
     pub buffer_info: Option<BufferInfo>,
 }

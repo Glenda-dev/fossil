@@ -78,7 +78,7 @@ const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 /// The reader should support reading byte offsets.
 pub fn detect_fs<F, E>(mut read_offset: F) -> FileSystemType
 where
-    F: FnMut(u64, &mut [u8]) -> Result<(), E>,
+    F: FnMut(usize, &mut [u8]) -> Result<(), E>,
 {
     // 1. Check for FAT / ExFAT at offset 0
     let mut boot_sector = [0u8; 512];
