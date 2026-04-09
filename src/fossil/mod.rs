@@ -1,7 +1,6 @@
 use crate::FSConfig;
 use crate::layout::PROBE_VADDR;
-use crate::utils::gpt::{GPTHeader, GPTPartition};
-use crate::utils::mbr::MBR;
+use crate::probe::{fs, part};
 use alloc::collections::VecDeque;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -28,7 +27,6 @@ use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 mod buffer;
 mod proxy;
 mod server;
-mod sniffer;
 mod volume;
 
 pub use buffer::{CacheBlock, RequestContext};
@@ -105,90 +103,6 @@ impl<'a> FossilServer<'a> {
             buffer_cache: buffer::BufferCache::new(0, 0, 4096),
             global_shm: None,
         }
-    }
-
-    fn probe_partitions<F>(
-        &self,
-        parent_desc: &glenda::protocol::device::LogicDeviceDesc,
-        sector0: &[u8],
-        block_size: usize,
-        mut read_fn: F,
-    ) -> Vec<(glenda::protocol::device::LogicDeviceDesc, usize, usize)>
-    where
-        F: FnMut(usize, &mut [u8]) -> Result<(), Error>,
-    {
-        let mut results = Vec::new();
-
-        // GPT header is at offset 512.
-        // If block_size is 512, it's LBA 1.
-        // If block_size is 4096, it's inside LBA 0 (which we already have in sector0).
-        let gpt_header_buf = if block_size == 512 {
-            let mut buf = [0u8; 512];
-            if read_fn(1, &mut buf).is_ok() { Some(buf) } else { None }
-        } else if block_size >= 1024 {
-            let mut buf = [0u8; 512];
-            buf.copy_from_slice(&sector0[512..1024]);
-            Some(buf)
-        } else {
-            None
-        };
-
-        if let Some(mbr) = MBR::parse(sector0) {
-            if mbr.is_protective_gpt() {
-                if let Some(header_buf) = gpt_header_buf {
-                    if let Some(header) = GPTHeader::parse(&header_buf) {
-                        let mut entries_buf = [0u8; 128 * 128];
-                        let entries_len = header.num_partition_entries as usize
-                            * header.partition_entry_size as usize;
-                        let entries_blk_count = (entries_len + block_size - 1) / block_size;
-                        if let Ok(_) = read_fn(
-                            header.partition_entry_lba as usize,
-                            &mut entries_buf[..entries_blk_count * block_size],
-                        ) {
-                            let gpt_parts = GPTPartition::parse_entries(
-                                &entries_buf[..entries_len],
-                                header.num_partition_entries,
-                                header.partition_entry_size,
-                            );
-                            let mut part_index = 0;
-                            for part in gpt_parts.iter() {
-                                if part.is_active() {
-                                    let name =
-                                        alloc::format!("{}p{}", parent_desc.name, part_index);
-                                    let desc = glenda::protocol::device::LogicDeviceDesc {
-                                        name: name.clone(),
-                                        dev_type: LogicDeviceType::Volume,
-                                        parent_name: parent_desc.name.clone(),
-                                        badge: None,
-                                    };
-                                    results.push((
-                                        desc,
-                                        part.first_lba as usize,
-                                        ((part.last_lba - part.first_lba) as usize + 1),
-                                    ));
-                                    part_index += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                let mut p_index = 0;
-                for i in 0..4 {
-                    if let Some(entry) = &mbr.partitions[i] {
-                        let desc = glenda::protocol::device::LogicDeviceDesc {
-                            name: alloc::format!("{}p{}", parent_desc.name, p_index),
-                            dev_type: LogicDeviceType::Volume,
-                            parent_name: parent_desc.name.clone(),
-                            badge: None,
-                        };
-                        results.push((desc, entry.start_lba as usize, entry.sectors_count as usize));
-                        p_index += 1;
-                    }
-                }
-            }
-        }
-        results
     }
 
     pub fn sync_devices(&mut self) -> Result<(), Error> {
@@ -312,14 +226,24 @@ impl<'a> FossilServer<'a> {
         let mut first_block = [0u8; 4096];
         self.read_block(&client, hw_id_usize, 0, &mut first_block[..block_size])?;
 
-        let mut partitions = {
+        let detected_parts = {
             let server_ptr = core::cell::UnsafeCell::new(&mut *self);
-            let s = unsafe { &*server_ptr.get() };
-            s.probe_partitions(&desc, &first_block[..block_size], block_size, |lba, target| {
+            part::detect_partitions_registered(&first_block[..block_size], block_size, |lba, target| {
                 let s_mut = unsafe { &mut *server_ptr.get() };
                 s_mut.read_block(&client, hw_id_usize, lba, target)
             })
         };
+
+        let mut partitions = Vec::new();
+        for (part_index, range) in detected_parts.into_iter().enumerate() {
+            let p_desc = glenda::protocol::device::LogicDeviceDesc {
+                name: alloc::format!("{}p{}", desc.name, part_index),
+                dev_type: LogicDeviceType::Volume,
+                parent_name: desc.name.clone(),
+                badge: None,
+            };
+            partitions.push((p_desc, range.start_lba, range.num_blocks));
+        }
 
         // Fallback: If no partition table found, treat the whole device as one partition
         if partitions.is_empty() {
@@ -354,7 +278,7 @@ impl<'a> FossilServer<'a> {
             // Sniff FS
             let fs_type = {
                 let s_ptr = core::cell::UnsafeCell::new(&mut *self);
-                sniffer::detect_fs(|offset, target| {
+                fs::detect_fs_registered(|offset, target| {
                     let s = unsafe { &mut *s_ptr.get() };
                     let sector = first_lba + offset / block_size as usize;
                     let offset_in_sector = offset % block_size as usize;

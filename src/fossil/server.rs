@@ -153,12 +153,11 @@ impl<'a> SystemService for FossilServer<'a> {
                 })
             },
             (VOLUME_PROTO, glenda::protocol::volume::MOUNT_PARTITION) => |s: &mut Self, u: &mut UTCB| {
-               handle_call(u, |u| {
+               handle_cap_call(u, |u| {
                     let mut reader = unsafe { u.get_buffer_reader() };
                     let partition_name = reader.read_str()?;
-                    let mount_point = reader.read_str()?;
-                    s.mount_partition(u.get_badge(), &partition_name, &mount_point)?;
-                    Ok(())
+                    let ep = s.mount_partition(u.get_badge(), &partition_name)?;
+                    Ok(ep.cap())
                 })
             },
             (VOLUME_PROTO, glenda::protocol::volume::GET_INFO) => |s: &mut Self, u: &mut UTCB| {

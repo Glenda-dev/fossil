@@ -6,6 +6,7 @@ mod config;
 mod fossil;
 mod layout;
 mod policy;
+mod probe;
 mod utils;
 
 #[macro_use]

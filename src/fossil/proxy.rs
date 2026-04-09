@@ -1,5 +1,5 @@
-use crate::fossil::sniffer;
 use crate::fossil::{FossilServer, buffer};
+use crate::probe::fs::FileSystemType;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -26,7 +26,7 @@ pub struct PartitionProxy {
     pub meta: PartitionMetadata,
     pub hardware_ep: Endpoint,
     pub name: String,
-    pub fs_type: sniffer::FileSystemType,
+    pub fs_type: FileSystemType,
     pub hardware_badge: Badge,
 }
 
@@ -35,7 +35,7 @@ impl PartitionProxy {
         meta: PartitionMetadata,
         hardware_ep: Endpoint,
         name: String,
-        fs_type: sniffer::FileSystemType,
+        fs_type: FileSystemType,
         hardware_badge: Badge,
     ) -> Self {
         Self { meta, hardware_ep, name, fs_type, hardware_badge }
