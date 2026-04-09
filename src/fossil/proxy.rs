@@ -42,7 +42,7 @@ impl PartitionProxy {
     }
 
     pub fn translate_sqe(&self, sqe: &mut SQE) {
-        sqe.off += self.meta.start_lba * 512;
+        sqe.off += self.meta.start_lba;
     }
 }
 
@@ -126,6 +126,11 @@ impl<'a> FossilServer<'a> {
             while let Some(mut sqe) = ring.ring.pop_sqe() {
                 proxy.translate_sqe(&mut sqe);
 
+                let device_block_size = proxy.meta.block_size as usize;
+                let cache_block_size = self.buffer_cache.get_block_size();
+                let sectors_per_cache_block =
+                    core::cmp::max(1, cache_block_size / device_block_size);
+
                 if let Some(shm) = self.client_shms.get(&badge_bits) {
                     let addr = sqe.addr as usize;
                     if addr >= shm.vaddr && addr < shm.vaddr + shm.size {
@@ -136,13 +141,19 @@ impl<'a> FossilServer<'a> {
                     }
                 }
 
-                let hw_user_data = self.next_partition_badge.fetch_add(1, Ordering::Relaxed) as usize
+                let hw_user_data = self.next_partition_badge.fetch_add(1, Ordering::Relaxed)
+                    as usize
                     | (1_usize << (usize::BITS - 1));
 
                 let client_user_data = sqe.user_data;
                 sqe.user_data = hw_user_data;
 
-                if buffer::IOBufferManager::is_aligned(&sqe, 4096) {
+                let req_start_bytes = sqe.off * device_block_size;
+                let req_len_bytes = sqe.len as usize;
+                let is_cache_aligned = req_start_bytes % cache_block_size == 0
+                    && req_len_bytes % cache_block_size == 0;
+
+                if is_cache_aligned {
                     let ctx = buffer::RequestContext {
                         client_badge: badge_bits,
                         client_user_data,
@@ -151,20 +162,42 @@ impl<'a> FossilServer<'a> {
                     self.inflight_requests.insert(hw_user_data, ctx);
                     hw_ring.submit(sqe)?;
                 } else {
-                    let aligned_offset = sqe.off & !7usize; // Aligned to 4KB (8 sectors)
-                    let end_offset = (sqe.off + (sqe.len as usize + 511) / 512 + 7) & !7usize;
-                    let aligned_len_sectors = (end_offset - aligned_offset) as u32;
+                    let aligned_offset =
+                        (sqe.off / sectors_per_cache_block) * sectors_per_cache_block;
+                    let req_len_sectors =
+                        (req_len_bytes + device_block_size - 1) / device_block_size;
+                    let end_offset = sqe.off + req_len_sectors;
+                    let aligned_end_offset = ((end_offset + sectors_per_cache_block - 1)
+                        / sectors_per_cache_block)
+                        * sectors_per_cache_block;
+                    let aligned_len_sectors = aligned_end_offset - aligned_offset;
+                    let aligned_len_bytes = aligned_len_sectors * device_block_size;
 
-                    let cache_res = self.buffer_cache.access_block(hw_id, aligned_offset);
+                    if aligned_len_bytes > cache_block_size {
+                        let ctx = buffer::RequestContext {
+                            client_badge: badge_bits,
+                            client_user_data,
+                            buffer_info: None,
+                        };
+                        self.inflight_requests.insert(hw_user_data, ctx);
+                        hw_ring.submit(sqe)?;
+                        continue;
+                    }
+
+                    let cache_res = self.buffer_cache.access_block(
+                        hw_id,
+                        aligned_offset,
+                        sectors_per_cache_block,
+                    );
                     let is_rmw = sqe.opcode == IOURING_OP_WRITE
-                        && (sqe.off != aligned_offset || sqe.len != aligned_len_sectors * 512);
+                        && (sqe.off != aligned_offset || req_len_bytes != aligned_len_bytes);
 
                     let buffer_info = buffer::BufferInfo {
                         original_addr: sqe.addr,
                         original_len: sqe.len,
                         original_offset: sqe.off,
                         aligned_offset,
-                        aligned_len: aligned_len_sectors * 512,
+                        aligned_len: aligned_len_bytes as u32,
                         is_write: sqe.opcode == IOURING_OP_WRITE,
                         is_rmw,
                         cache_idx: Some(cache_res.block_idx),
@@ -178,7 +211,7 @@ impl<'a> FossilServer<'a> {
 
                     sqe.addr = cache_res.buf_vaddr as usize;
                     sqe.off = aligned_offset;
-                    sqe.len = aligned_len_sectors * 512;
+                    sqe.len = aligned_len_bytes as u32;
 
                     self.inflight_requests.insert(hw_user_data, ctx);
 
@@ -205,9 +238,9 @@ impl<'a> FossilServer<'a> {
                         // Copy to client buffer
                         if let Some(shm) = self.client_shms.get(&badge_bits) {
                             if let Some(gshm) = &self.global_shm {
-                                let src_ptr = (cache_res.buf_vaddr
-                                    + (buffer_info.original_offset - aligned_offset) as usize)
-                                    as *const u8;
+                                let offset_bytes = (buffer_info.original_offset - aligned_offset)
+                                    * device_block_size;
+                                let src_ptr = (cache_res.buf_vaddr + offset_bytes) as *const u8;
                                 let dst_offset = buffer_info.original_addr as usize - shm.vaddr;
                                 let dst_ptr = (gshm.vaddr() + dst_offset) as *mut u8;
                                 unsafe {
@@ -237,6 +270,12 @@ impl<'a> FossilServer<'a> {
                     while let Some(cqe) = ring.pop_completion() {
                         if let Some(ctx) = self.inflight_requests.remove(&cqe.user_data) {
                             let mut res = cqe.res;
+                            let device_block_size = self
+                                .partitions
+                                .get(&ctx.client_badge)
+                                .map(|p| p.meta.block_size as usize)
+                                .unwrap_or(512);
+                            let cache_block_size = self.buffer_cache.get_block_size();
                             if let Some(buf_info) = ctx.buffer_info {
                                 if cqe.res >= 0 {
                                     res = buf_info.original_len as i32;
@@ -258,11 +297,12 @@ impl<'a> FossilServer<'a> {
                                                     // cache_res vaddr is base + offset
                                                     let cache_vaddr =
                                                         self.buffer_cache.get_base_vaddr()
-                                                            + (cidx * 4096);
-                                                    let src_ptr = (cache_vaddr
-                                                        + (original_offset - aligned_offset)
-                                                            as usize)
-                                                        as *const u8;
+                                                            + (cidx * cache_block_size);
+                                                    let byte_delta = (original_offset
+                                                        - aligned_offset)
+                                                        * device_block_size;
+                                                    let src_ptr =
+                                                        (cache_vaddr + byte_delta) as *const u8;
                                                     let dst_offset =
                                                         buf_info.original_addr as usize - shm.vaddr;
                                                     let dst_ptr =
@@ -292,11 +332,12 @@ impl<'a> FossilServer<'a> {
 
                                                     let cache_vaddr =
                                                         self.buffer_cache.get_base_vaddr()
-                                                            + (cidx * 4096);
-                                                    let dst_ptr = (cache_vaddr
-                                                        + (original_offset - aligned_offset)
-                                                            as usize)
-                                                        as *mut u8;
+                                                            + (cidx * cache_block_size);
+                                                    let byte_delta = (original_offset
+                                                        - aligned_offset)
+                                                        * device_block_size;
+                                                    let dst_ptr =
+                                                        (cache_vaddr + byte_delta) as *mut u8;
                                                     let src_offset =
                                                         buf_info.original_addr as usize - shm.vaddr;
                                                     let src_ptr =
@@ -338,7 +379,7 @@ impl<'a> FossilServer<'a> {
                                                             glenda::io::uring::IOURING_OP_WRITE;
                                                         sqe.addr =
                                                             (self.buffer_cache.get_base_vaddr()
-                                                                + cidx * 4096)
+                                                                + cidx * cache_block_size)
                                                                 as usize;
                                                         sqe.off = buf_info.aligned_offset;
                                                         sqe.len = buf_info.aligned_len;

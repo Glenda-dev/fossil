@@ -18,8 +18,8 @@ pub struct CacheBlock {
     pub device_id: usize,
     pub sector_idx: usize,
     pub state: BlockState,
-    pub buf_offset: usize, // Offset in the global buffer
-    pub last_access: usize,  // For LRU
+    pub buf_offset: usize,  // Offset in the global buffer
+    pub last_access: usize, // For LRU
 }
 
 pub struct BufferCache {
@@ -101,13 +101,16 @@ impl BufferCache {
 
     /// Access a block. If present, returns index and update LRU.
     /// If absent, evict LRU or use free block, return index.
-    pub fn access_block(&mut self, device_id: usize, sector_idx: usize) -> CacheResult {
+    pub fn access_block(
+        &mut self,
+        device_id: usize,
+        sector_idx: usize,
+        sectors_per_cache_block: usize,
+    ) -> CacheResult {
         let access_time = self.access_counter.fetch_add(1, Ordering::SeqCst) as usize;
 
-        // Standardize on 4KB alignment for cache indexing.
-        // A "sector" in BufferCache is now a 4KB unit.
-        // Any sub-4KB sector device will be handled by grouping sectors.
-        let cache_sector_idx = sector_idx & !7; // Group 8x 512B sectors into one 4KB block
+        let sectors_per_cache_block = core::cmp::max(1, sectors_per_cache_block);
+        let cache_sector_idx = (sector_idx / sectors_per_cache_block) * sectors_per_cache_block;
 
         if let Some(&idx) = self.lookup.get(&(device_id, cache_sector_idx)) {
             // Cache Hit

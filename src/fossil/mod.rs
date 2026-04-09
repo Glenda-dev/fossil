@@ -154,21 +154,39 @@ impl<'a> FossilServer<'a> {
         target: &mut [u8],
     ) -> Result<(), Error> {
         let block_size = client.block_size() as usize;
-        let res = self.buffer_cache.access_block(hw_id, lba);
+        let cache_block_size = self.buffer_cache.get_block_size();
+        let sectors_per_cache_block = core::cmp::max(1, cache_block_size / block_size);
+        let cache_base_lba = (lba / sectors_per_cache_block) * sectors_per_cache_block;
+        let lba_in_cache = lba - cache_base_lba;
+        let byte_offset = lba_in_cache * block_size;
+
+        let res = self.buffer_cache.access_block(hw_id, lba, sectors_per_cache_block);
         let cache_vaddr = res.buf_vaddr;
 
         if !res.is_hit {
-            // Read from device into cache
-            let cache_slice =
-                unsafe { core::slice::from_raw_parts_mut(cache_vaddr as *mut u8, block_size) };
-            client.read_blocks(lba, 1, cache_slice)?;
+            // Fill the whole cache block window from device.
+            let cache_slice = unsafe {
+                core::slice::from_raw_parts_mut(
+                    cache_vaddr as *mut u8,
+                    sectors_per_cache_block * block_size,
+                )
+            };
+            for i in 0..sectors_per_cache_block {
+                let start = i * block_size;
+                let end = start + block_size;
+                client.read_blocks(cache_base_lba + i, 1, &mut cache_slice[start..end])?;
+            }
             self.buffer_cache.mark_valid(res.block_idx);
         }
 
-        let cache_slice =
-            unsafe { core::slice::from_raw_parts(cache_vaddr as *const u8, block_size) };
+        let cache_slice = unsafe {
+            core::slice::from_raw_parts(
+                cache_vaddr as *const u8,
+                sectors_per_cache_block * block_size,
+            )
+        };
         let copy_len = core::cmp::min(target.len(), block_size);
-        target[..copy_len].copy_from_slice(&cache_slice[..copy_len]);
+        target[..copy_len].copy_from_slice(&cache_slice[byte_offset..byte_offset + copy_len]);
         Ok(())
     }
 
@@ -228,10 +246,35 @@ impl<'a> FossilServer<'a> {
 
         let detected_parts = {
             let server_ptr = core::cell::UnsafeCell::new(&mut *self);
-            part::detect_partitions_registered(&first_block[..block_size], block_size, |lba, target| {
-                let s_mut = unsafe { &mut *server_ptr.get() };
-                s_mut.read_block(&client, hw_id_usize, lba, target)
-            })
+            part::detect_partitions_registered(
+                &first_block[..block_size],
+                block_size,
+                |lba, target| {
+                    let s_mut = unsafe { &mut *server_ptr.get() };
+                    let mut copied = 0usize;
+                    let mut cur_lba = lba;
+
+                    while copied < target.len() {
+                        if (target.len() - copied) >= block_size {
+                            s_mut.read_block(
+                                &client,
+                                hw_id_usize,
+                                cur_lba,
+                                &mut target[copied..copied + block_size],
+                            )?;
+                            copied += block_size;
+                            cur_lba += 1;
+                        } else {
+                            let mut temp = alloc::vec![0u8; block_size];
+                            s_mut.read_block(&client, hw_id_usize, cur_lba, &mut temp)?;
+                            let copy_len = target.len() - copied;
+                            target[copied..copied + copy_len].copy_from_slice(&temp[..copy_len]);
+                            copied += copy_len;
+                        }
+                    }
+                    Ok(())
+                },
+            )
         };
 
         let mut partitions = Vec::new();
@@ -280,21 +323,34 @@ impl<'a> FossilServer<'a> {
                 let s_ptr = core::cell::UnsafeCell::new(&mut *self);
                 fs::detect_fs_registered(|offset, target| {
                     let s = unsafe { &mut *s_ptr.get() };
-                    let sector = first_lba + offset / block_size as usize;
-                    let offset_in_sector = offset % block_size as usize;
+                    let mut copied = 0usize;
+                    while copied < target.len() {
+                        let cur_offset = offset + copied;
+                        let sector = first_lba + cur_offset / block_size as usize;
+                        let offset_in_sector = cur_offset % block_size as usize;
 
-                    if offset_in_sector == 0 && target.len() >= block_size {
-                        s.read_block(&client, hw_id_usize, sector, target)
-                    } else {
-                        let mut temp = [0u8; 4096];
-                        s.read_block(&client, hw_id_usize, sector, &mut temp[..block_size])?;
-                        let copy_len =
-                            core::cmp::min(target.len(), block_size - offset_in_sector as usize);
-                        target[..copy_len].copy_from_slice(
-                            &temp[offset_in_sector as usize..offset_in_sector as usize + copy_len],
-                        );
-                        Ok(())
+                        if offset_in_sector == 0 && (target.len() - copied) >= block_size {
+                            s.read_block(
+                                &client,
+                                hw_id_usize,
+                                sector,
+                                &mut target[copied..copied + block_size],
+                            )?;
+                            copied += block_size;
+                        } else {
+                            let mut temp = [0u8; 4096];
+                            s.read_block(&client, hw_id_usize, sector, &mut temp[..block_size])?;
+                            let copy_len = core::cmp::min(
+                                target.len() - copied,
+                                block_size - offset_in_sector,
+                            );
+                            target[copied..copied + copy_len].copy_from_slice(
+                                &temp[offset_in_sector..offset_in_sector + copy_len],
+                            );
+                            copied += copy_len;
+                        }
                     }
+                    Ok(())
                 })
             };
             log!("Partition {} FS type: {:?}", p_desc.name, fs_type);

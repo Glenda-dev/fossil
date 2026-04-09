@@ -25,8 +25,7 @@ pub fn probe_gpt(
     }?;
 
     let header = GPTHeader::parse(&gpt_header_buf)?;
-    let entries_len =
-        header.num_partition_entries as usize * header.partition_entry_size as usize;
+    let entries_len = header.num_partition_entries as usize * header.partition_entry_size as usize;
     if entries_len == 0 {
         return None;
     }
