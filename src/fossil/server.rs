@@ -1,6 +1,6 @@
 use super::FossilServer;
 use crate::FSConfig;
-use glenda::cap::{CapPtr, Endpoint, Reply};
+use glenda::cap::{CSPACE_CAP, CapPtr, Endpoint, Reply};
 use glenda::error::Error;
 use glenda::interface::CSpaceService;
 use glenda::interface::{
@@ -113,6 +113,7 @@ impl<'a> SystemService for FossilServer<'a> {
                 }
                 Err(Error::Success) => {
                     // Handled notification, skip reply
+                    let _ = CSPACE_CAP.delete(self.reply.cap());
                 }
                 Err(e) => {
                     let badge = utcb.get_badge();

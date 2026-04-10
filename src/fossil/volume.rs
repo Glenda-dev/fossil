@@ -8,7 +8,12 @@ use glenda::ipc::Badge;
 impl<'a> FossilServer<'a> {
     fn mint_partition_endpoint(&mut self, partition_badge: usize) -> Result<Endpoint, Error> {
         let slot = self.cspace.alloc(self.res_client)?;
-        CSPACE_CAP.mint(self.endpoint.cap(), slot, Badge::new(partition_badge), Rights::ALL)?;
+        CSPACE_CAP.mint_self(
+            self.endpoint.cap(),
+            slot,
+            Badge::new(partition_badge),
+            Rights::ALL,
+        )?;
         Ok(Endpoint::from(slot))
     }
 }
