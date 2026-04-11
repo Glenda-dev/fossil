@@ -89,7 +89,7 @@ impl<'a> FossilServer<'a> {
             return Err(Error::AlreadyExists);
         }
         let notify_slot = self.cspace.alloc(self.res_client).map_err(|_| Error::OutOfMemory)?;
-        CSPACE_CAP.transfer_self(self.recv, notify_slot)?;
+        CSPACE_CAP.transfer_self(self.ipc.recv, notify_slot)?;
         let notify_ep = Endpoint::from(notify_slot);
 
         let ring_size = 64 + (sq_entries as usize * 64) + (cq_entries as usize * 16);

@@ -9,7 +9,7 @@ impl<'a> FossilServer<'a> {
     fn mint_partition_endpoint(&mut self, partition_badge: usize) -> Result<Endpoint, Error> {
         let slot = self.cspace.alloc(self.res_client)?;
         CSPACE_CAP.mint_self(
-            self.endpoint.cap(),
+            self.ipc.endpoint.cap(),
             slot,
             Badge::new(partition_badge),
             Rights::ALL,

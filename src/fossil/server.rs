@@ -63,7 +63,7 @@ impl<'a> SystemService for FossilServer<'a> {
 
         log!("Hooked to Unicorn for block devices");
         let target = HookTarget::Type(LogicDeviceType::Block);
-        self.device_client.hook(Badge::null(), target, self.endpoint.cap())?;
+        self.device_client.hook(Badge::null(), target, self.ipc.endpoint.cap())?;
 
         // Register Volume endpoint with Warren
         log!("Registering Volume Service...");
@@ -72,7 +72,7 @@ impl<'a> SystemService for FossilServer<'a> {
                 Badge::null(),
                 glenda::protocol::resource::ResourceType::Endpoint,
                 glenda::protocol::resource::VOLUME_ENDPOINT,
-                self.endpoint.cap(),
+                self.ipc.endpoint.cap(),
             )
             .ok();
 
@@ -80,17 +80,17 @@ impl<'a> SystemService for FossilServer<'a> {
     }
 
     fn listen(&mut self, ep: Endpoint, reply: CapPtr, recv: CapPtr) -> Result<(), Error> {
-        self.endpoint = ep;
-        self.reply = Reply::from(reply);
-        self.recv = recv;
+        self.ipc.endpoint = ep;
+        self.ipc.reply = Reply::from(reply);
+        self.ipc.recv = recv;
         Ok(())
     }
 
     fn run(&mut self) -> Result<(), Error> {
         self.init_client.report_service(Badge::null(), ServiceState::Running)?;
-        self.running = true;
+        self.ipc.running = true;
 
-        while self.running {
+        while self.ipc.running {
             // Process any pending device probes first
             if let Err(e) = self.process_pending_probes() {
                 log!("Probe failed: {:?}", e);
@@ -99,10 +99,10 @@ impl<'a> SystemService for FossilServer<'a> {
             let mut utcb = unsafe { UTCB::new() };
             utcb.clear();
 
-            utcb.set_reply_window(self.reply.cap());
-            utcb.set_recv_window(self.recv);
+            utcb.set_reply_window(self.ipc.reply.cap());
+            utcb.set_recv_window(self.ipc.recv);
 
-            if let Err(e) = self.endpoint.recv(&mut utcb) {
+            if let Err(e) = self.ipc.endpoint.recv(&mut utcb) {
                 error!("Recv error: {:?}", e);
                 continue;
             }
@@ -113,7 +113,7 @@ impl<'a> SystemService for FossilServer<'a> {
                 }
                 Err(Error::Success) => {
                     // Handled notification, skip reply
-                    let _ = CSPACE_CAP.delete(self.reply.cap());
+                    let _ = CSPACE_CAP.delete(self.ipc.reply.cap());
                 }
                 Err(e) => {
                     let badge = utcb.get_badge();
@@ -233,10 +233,10 @@ impl<'a> SystemService for FossilServer<'a> {
     }
 
     fn reply(&mut self, utcb: &mut UTCB) -> Result<(), Error> {
-        self.reply.reply(utcb)
+        self.ipc.reply.reply(utcb)
     }
 
     fn stop(&mut self) {
-        self.running = false;
+        self.ipc.running = false;
     }
 }

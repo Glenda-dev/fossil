@@ -32,10 +32,15 @@ mod volume;
 pub use buffer::{CacheBlock, RequestContext};
 pub use proxy::{PartitionMetadata, PartitionProxy};
 
-pub struct FossilServer<'a> {
+pub struct FossilIpc {
     pub endpoint: Endpoint,
     pub reply: Reply,
     pub recv: CapPtr,
+    pub running: bool,
+}
+
+pub struct FossilServer<'a> {
+    pub ipc: FossilIpc,
     pub res_client: &'a mut ResourceClient,
     pub device_client: &'a mut DeviceClient,
     pub process_client: &'a mut ProcessClient,
@@ -56,8 +61,6 @@ pub struct FossilServer<'a> {
     pub driver_to_partition: BTreeMap<usize, usize>,
     pub next_partition_badge: AtomicUsize,
     pub mem_pool: MemoryPool,
-    pub running: bool,
-
     pub pending_devices: VecDeque<String>,
     pub probe_tcb: Option<TCB>,
 
@@ -77,9 +80,12 @@ impl<'a> FossilServer<'a> {
         init_client: &'a mut InitClient,
     ) -> Self {
         Self {
-            endpoint,
-            reply: Reply::from(CapPtr::null()),
-            recv: CapPtr::null(),
+            ipc: FossilIpc {
+                endpoint,
+                reply: Reply::from(CapPtr::null()),
+                recv: CapPtr::null(),
+                running: false,
+            },
             res_client,
             process_client,
             device_client,
@@ -97,7 +103,6 @@ impl<'a> FossilServer<'a> {
             driver_to_partition: BTreeMap::new(),
             next_partition_badge: AtomicUsize::new(0x1000),
             mem_pool: MemoryPool::new(PROBE_VADDR + PGSIZE * 512),
-            running: false,
             pending_devices: VecDeque::new(),
             probe_tcb: None,
             buffer_cache: buffer::BufferCache::new(0, 0, 4096),
@@ -211,7 +216,7 @@ impl<'a> FossilServer<'a> {
                     RingParams {
                         sq_entries: 4,
                         cq_entries: 4,
-                        notify_ep: self.endpoint,
+                        notify_ep: self.ipc.endpoint,
                         recv_slot: ring_slot,
                         vaddr: ring_vaddr,
                         size: PGSIZE,
