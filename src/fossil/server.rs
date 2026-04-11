@@ -59,8 +59,11 @@ impl<'a> SystemService for FossilServer<'a> {
 
         self.global_shm = Some(shm);
 
-        // Register hook for future devices
+        // One-shot initial scan/probe for existing devices before reporting Running.
+        self.sync_devices()?;
+        self.process_pending_probes()?;
 
+        // Register hook for future devices (hotplug after initial one-shot scan)
         log!("Hooked to Unicorn for block devices");
         let target = HookTarget::Type(LogicDeviceType::Block);
         self.device_client.hook(Badge::null(), target, self.ipc.endpoint.cap())?;
@@ -76,6 +79,8 @@ impl<'a> SystemService for FossilServer<'a> {
             )
             .ok();
 
+        self.init_client.report_service(Badge::null(), ServiceState::Running)?;
+
         Ok(())
     }
 
@@ -87,7 +92,6 @@ impl<'a> SystemService for FossilServer<'a> {
     }
 
     fn run(&mut self) -> Result<(), Error> {
-        self.init_client.report_service(Badge::null(), ServiceState::Running)?;
         self.ipc.running = true;
 
         while self.ipc.running {
