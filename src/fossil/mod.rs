@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Endpoint, Frame, Reply, TCB};
+use glenda::cap::{CapPtr, Endpoint, Frame, Reply};
 use glenda::client::{DeviceClient, InitClient, ProcessClient, ResourceClient};
 use glenda::drivers::client::block::BlockClient;
 use glenda::drivers::client::{RingParams, ShmParams};
@@ -22,6 +22,7 @@ use glenda::mem::Perms;
 use glenda::mem::pool::{MemoryPool, ShmType};
 use glenda::mem::shm::SharedMemory;
 use glenda::protocol::device::LogicDeviceType;
+use glenda::protocol::init::ServiceState;
 use glenda::utils::manager::{CSpaceManager, VSpaceManager};
 
 mod buffer;
@@ -50,6 +51,9 @@ pub struct FossilServer<'a> {
 
     pub partitions: BTreeMap<usize, PartitionProxy>,
     pub name_to_badge: BTreeMap<String, usize>,
+    pub partition_fs_endpoints: BTreeMap<usize, Endpoint>,
+    pub partition_driver_pids: BTreeMap<usize, usize>,
+    pub partition_driver_states: BTreeMap<usize, ServiceState>,
     pub client_rings: BTreeMap<usize, IoUringServer>,
     pub client_shms: BTreeMap<usize, ShmParams>,
     pub device_clients: BTreeMap<usize, BlockClient>,
@@ -62,7 +66,7 @@ pub struct FossilServer<'a> {
     pub next_partition_badge: AtomicUsize,
     pub mem_pool: MemoryPool,
     pub pending_devices: VecDeque<String>,
-    pub probe_tcb: Option<TCB>,
+    pub pending_mount_replies: BTreeMap<usize, VecDeque<CapPtr>>,
 
     // Block Cache
     pub buffer_cache: buffer::BufferCache,
@@ -94,6 +98,9 @@ impl<'a> FossilServer<'a> {
             vspace,
             partitions: BTreeMap::new(),
             name_to_badge: BTreeMap::new(),
+            partition_fs_endpoints: BTreeMap::new(),
+            partition_driver_pids: BTreeMap::new(),
+            partition_driver_states: BTreeMap::new(),
             client_rings: BTreeMap::new(),
             device_clients: BTreeMap::new(),
             probed_hardware: BTreeSet::new(),
@@ -104,10 +111,55 @@ impl<'a> FossilServer<'a> {
             next_partition_badge: AtomicUsize::new(0x1000),
             mem_pool: MemoryPool::new(PROBE_VADDR + PGSIZE * 512),
             pending_devices: VecDeque::new(),
-            probe_tcb: None,
+            pending_mount_replies: BTreeMap::new(),
             buffer_cache: buffer::BufferCache::new(0, 0, 4096),
             global_shm: None,
         }
+    }
+
+    fn fs_type_compatible_key(fs_type: fs::FileSystemType) -> Option<&'static str> {
+        match fs_type {
+            fs::FileSystemType::Fat16 => Some("fat16"),
+            fs::FileSystemType::Fat32 => Some("fat32"),
+            fs::FileSystemType::ExFat => Some("exfat"),
+            fs::FileSystemType::Ext2 => Some("ext2"),
+            fs::FileSystemType::Ext3 => Some("ext3"),
+            fs::FileSystemType::Ext4 => Some("ext4"),
+            fs::FileSystemType::InitrdFS => Some("initrdfs"),
+            fs::FileSystemType::Unknown => None,
+        }
+    }
+
+    fn select_fs_driver_binary(&self, fs_type: fs::FileSystemType) -> Option<String> {
+        let key = Self::fs_type_compatible_key(fs_type)?;
+        let cfg = self.fs_config.as_ref()?;
+
+        for driver in &cfg.filesystems {
+            if driver.compatible.iter().any(|c| c == key) {
+                return Some(driver.binary.clone());
+            }
+        }
+
+        None
+    }
+
+    pub(crate) fn ensure_partition_fs_driver(
+        &mut self,
+        partition_badge: usize,
+        partition_name: &str,
+        fs_type: fs::FileSystemType,
+    ) -> Result<(), Error> {
+        let binary = self.select_fs_driver_binary(fs_type).ok_or(Error::NotFound)?;
+        if !self.partition_driver_pids.contains_key(&partition_badge) {
+            log!("Spawning FS driver {} for partition {}", binary, partition_name);
+
+            let pid = self.process_client.spawn(Badge::null(), &binary)?;
+            self.driver_to_partition.insert(pid, partition_badge);
+            self.partition_driver_pids.insert(partition_badge, pid);
+            self.partition_driver_states.insert(partition_badge, ServiceState::Starting);
+        }
+
+        Ok(())
     }
 
     pub fn sync_devices(&mut self) -> Result<(), Error> {
@@ -122,9 +174,6 @@ impl<'a> FossilServer<'a> {
             if !self.pending_devices.contains(&name) {
                 self.pending_devices.push_back(name);
             }
-        }
-        if let Some(tcb) = self.probe_tcb {
-            tcb.resume().ok();
         }
         Ok(())
     }
@@ -141,12 +190,9 @@ impl<'a> FossilServer<'a> {
                         &name,
                         hw_slot,
                     )?;
-                    self.probe(hw_id, desc, hw_ep)?;
+                    self.probe(hw_id, &name, desc, hw_ep)?;
                 }
             }
-        }
-        if let Some(tcb) = self.probe_tcb {
-            tcb.suspend().ok();
         }
         Ok(())
     }
@@ -198,10 +244,11 @@ impl<'a> FossilServer<'a> {
     fn probe(
         &mut self,
         hardware_id: usize,
+        logical_name: &str,
         desc: glenda::protocol::device::LogicDeviceDesc,
         hardware_ep: Endpoint,
     ) -> Result<(), Error> {
-        log!("Probing device {} (ID: {})", desc.name, hardware_id);
+        log!("Probing device {} (driver={}) (ID: {})", logical_name, desc.name, hardware_id);
         let gshm = self.global_shm.as_ref().ok_or(Error::NotInitialized)?;
         let ring_slot = self.cspace.alloc(self.res_client)?;
         let ring_vaddr = self.mem_pool.reserve(PGSIZE);
@@ -285,9 +332,9 @@ impl<'a> FossilServer<'a> {
         let mut partitions = Vec::new();
         for (part_index, range) in detected_parts.into_iter().enumerate() {
             let p_desc = glenda::protocol::device::LogicDeviceDesc {
-                name: alloc::format!("{}p{}", desc.name, part_index),
+                name: alloc::format!("{}p{}", logical_name, part_index),
                 dev_type: LogicDeviceType::Volume,
-                parent_name: desc.name.clone(),
+                parent_name: String::from(logical_name),
                 badge: None,
             };
             partitions.push((p_desc, range.start_lba, range.num_blocks));
@@ -297,9 +344,9 @@ impl<'a> FossilServer<'a> {
         if partitions.is_empty() {
             partitions.push((
                 glenda::protocol::device::LogicDeviceDesc {
-                    name: alloc::format!("{}p0", desc.name),
+                    name: alloc::format!("{}p0", logical_name),
                     dev_type: LogicDeviceType::Volume,
-                    parent_name: desc.name.clone(),
+                    parent_name: String::from(logical_name),
                     badge: None,
                 },
                 0,
@@ -365,22 +412,11 @@ impl<'a> FossilServer<'a> {
             self.partitions.insert(badge.bits(), proxy);
             self.name_to_badge.insert(p_desc.name.clone(), badge.bits());
 
-            // Auto-spawn if configured
-            if let Some(ref config) = self.fs_config {
-                let fs_type_lower = alloc::format!("{:?}", fs_type).to_lowercase();
-                for driver in &config.filesystems {
-                    if driver.autostart && driver.compatible.contains(&fs_type_lower) {
-                        log!("Autostarting driver {} for {}", driver.name, p_desc.name);
-                        match self.process_client.spawn(badge, &driver.binary) {
-                            Ok(pid) => {
-                                self.driver_to_partition.insert(pid, badge.bits());
-                            }
-                            Err(e) => {
-                                error!("Failed to spawn driver {}: {:?}", driver.name, e);
-                            }
-                        }
-                    }
-                }
+            if let Err(e) = self.ensure_partition_fs_driver(badge.bits(), &p_desc.name, fs_type) {
+                warn!(
+                    "Failed to bind FS driver for partition {} ({:?}): {:?}",
+                    p_desc.name, fs_type, e
+                );
             }
         }
 

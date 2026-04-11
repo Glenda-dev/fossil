@@ -7,7 +7,7 @@ use glenda::interface::{
     DeviceService, InitService, ResourceService, SystemService, VolumeService,
 };
 use glenda::ipc::server::{handle_call, handle_cap_call, handle_notify};
-use glenda::ipc::{Badge, MsgTag, UTCB};
+use glenda::ipc::{Badge, MsgFlags, MsgTag, UTCB};
 use glenda::protocol::VOLUME_PROTO;
 use glenda::protocol::device::{HookTarget, LogicDeviceType};
 use glenda::protocol::init::ServiceState;
@@ -157,13 +157,20 @@ impl<'a> SystemService for FossilServer<'a> {
                     Ok(())
                 })
             },
-            (VOLUME_PROTO, glenda::protocol::volume::MOUNT_PARTITION) => |s: &mut Self, u: &mut UTCB| {
-               handle_cap_call(u, |u| {
-                    let mut reader = unsafe { u.get_buffer_reader() };
-                    let partition_name = reader.read_str()?;
-                    let ep = s.mount_partition(u.get_badge(), &partition_name)?;
-                    Ok(ep.cap())
+            (VOLUME_PROTO, glenda::protocol::volume::REPORT_STATE) => |s: &mut Self, u: &mut UTCB| {
+                handle_call(u, |u| {
+                    let state = ServiceState::from(u.get_mr(0));
+                    let endpoint = if u.get_msg_tag().flags().contains(MsgFlags::HAS_CAP) {
+                        Some(s.ipc.recv)
+                    } else {
+                        None
+                    };
+                    s.report_state(u.get_badge(), state, endpoint)?;
+                    Ok(())
                 })
+            },
+            (VOLUME_PROTO, glenda::protocol::volume::MOUNT_PARTITION) => |s: &mut Self, u: &mut UTCB| {
+                s.handle_mount_partition_request(u)
             },
             (VOLUME_PROTO, glenda::protocol::volume::GET_INFO) => |s: &mut Self, u: &mut UTCB| {
                 let badge = u.get_badge();

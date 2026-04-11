@@ -15,8 +15,6 @@ pub struct FSDriverConfig {
     pub name: String,
     pub binary: String,
     pub compatible: Vec<String>,
-    #[serde(default)]
-    pub autostart: bool,
 }
 
 fn default_buffer_size() -> usize {
