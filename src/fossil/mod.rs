@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use glenda::arch::mem::PGSIZE;
-use glenda::cap::{CapPtr, Endpoint, Frame, Reply};
+use glenda::cap::{CapPtr, Endpoint, Page, Reply};
 use glenda::client::{DeviceClient, InitClient, ProcessClient, ResourceClient};
 use glenda::drivers::client::block::BlockClient;
 use glenda::drivers::client::{RingParams, ShmParams};
@@ -282,7 +282,7 @@ impl<'a> FossilServer<'a> {
                     self.vspace,
                     self.cspace,
                     self.res_client,
-                    Frame::from(ring_slot),
+                    Page::from(ring_slot),
                     PGSIZE,
                     Perms::READ | Perms::WRITE,
                 )?;
