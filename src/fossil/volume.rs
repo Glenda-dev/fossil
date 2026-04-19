@@ -16,6 +16,7 @@ impl<'a> FossilServer<'a> {
             Badge::new(partition_badge),
             Rights::ALL,
         )?;
+        self.ledger_partition_ep_minted();
         Ok(Endpoint::from(slot))
     }
 
@@ -23,6 +24,7 @@ impl<'a> FossilServer<'a> {
         let reply_slot = self.cspace.alloc(self.res_client)?;
         CSPACE_CAP.transfer_self(self.ipc.reply.cap(), reply_slot)?;
         self.pending_mount_replies.entry(partition_badge).or_default().push_back(reply_slot);
+        self.ledger_mount_waiter_queued(reply_slot);
         Ok(())
     }
 
@@ -45,6 +47,7 @@ impl<'a> FossilServer<'a> {
                         utcb.set_msg_tag(MsgTag::err());
                         utcb.set_mr(0, Error::NotFound as usize);
                         let _ = glenda::cap::Reply::from(reply_slot).reply(&mut utcb);
+                        self.ledger_mount_waiter_woken(reply_slot);
                         let _ = CSPACE_CAP.delete(reply_slot);
                         continue;
                     };
@@ -76,6 +79,7 @@ impl<'a> FossilServer<'a> {
             }
 
             let _ = glenda::cap::Reply::from(reply_slot).reply(&mut utcb);
+            self.ledger_mount_waiter_woken(reply_slot);
             let _ = CSPACE_CAP.delete(reply_slot);
         }
 

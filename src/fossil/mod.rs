@@ -33,6 +33,14 @@ mod volume;
 pub use buffer::{CacheBlock, RequestContext};
 pub use proxy::{PartitionMetadata, PartitionProxy};
 
+#[derive(Debug, Default)]
+pub struct FossilResourceLedger {
+    pub mount_waiters_queued: usize,
+    pub mount_waiters_woken: usize,
+    pub partition_endpoint_mints: usize,
+    pub mount_reply_slots_live: BTreeSet<CapPtr>,
+}
+
 pub struct FossilIpc {
     pub endpoint: Endpoint,
     pub reply: Reply,
@@ -71,6 +79,7 @@ pub struct FossilServer<'a> {
     // Block Cache
     pub buffer_cache: buffer::BufferCache,
     pub global_shm: Option<SharedMemory>,
+    pub resource_ledger: FossilResourceLedger,
 }
 
 impl<'a> FossilServer<'a> {
@@ -114,8 +123,28 @@ impl<'a> FossilServer<'a> {
             pending_mount_replies: BTreeMap::new(),
             buffer_cache: buffer::BufferCache::new(0, 0, 4096),
             global_shm: None,
+            resource_ledger: FossilResourceLedger::default(),
         }
     }
+
+    pub(crate) fn ledger_mount_waiter_queued(&mut self, slot: CapPtr) {
+        self.resource_ledger.mount_waiters_queued =
+            self.resource_ledger.mount_waiters_queued.saturating_add(1);
+        self.resource_ledger.mount_reply_slots_live.insert(slot);
+    }
+
+    pub(crate) fn ledger_mount_waiter_woken(&mut self, slot: CapPtr) {
+        self.resource_ledger.mount_waiters_woken =
+            self.resource_ledger.mount_waiters_woken.saturating_add(1);
+        self.resource_ledger.mount_reply_slots_live.remove(&slot);
+    }
+
+    pub(crate) fn ledger_partition_ep_minted(&mut self) {
+        self.resource_ledger.partition_endpoint_mints =
+            self.resource_ledger.partition_endpoint_mints.saturating_add(1);
+    }
+
+    pub(crate) fn log_resource_ledger(&self, _reason: &str) {}
 
     fn fs_type_compatible_key(fs_type: fs::FileSystemType) -> Option<&'static str> {
         match fs_type {

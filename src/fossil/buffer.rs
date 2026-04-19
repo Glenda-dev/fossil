@@ -34,6 +34,31 @@ pub struct BufferCache {
     free_blocks: Vec<usize>,
     policy: Box<dyn ReplacementPolicy>,
     write_policy: Box<dyn WritePolicy>,
+    stats: CacheLedgerStats,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheLedgerStats {
+    pub hits: usize,
+    pub misses: usize,
+    pub evictions: usize,
+    pub dirty_evictions: usize,
+    pub mark_valid_calls: usize,
+    pub mark_dirty_calls: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheLedgerSnapshot {
+    pub hits: usize,
+    pub misses: usize,
+    pub evictions: usize,
+    pub dirty_evictions: usize,
+    pub mark_valid_calls: usize,
+    pub mark_dirty_calls: usize,
+    pub lookup_entries: usize,
+    pub free_blocks: usize,
+    pub valid_blocks: usize,
+    pub dirty_blocks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +97,7 @@ impl BufferCache {
             free_blocks,
             policy: Box::new(LruPolicy),
             write_policy: Box::new(WriteThrough),
+            stats: CacheLedgerStats::default(),
         }
     }
 
@@ -114,6 +140,7 @@ impl BufferCache {
 
         if let Some(&idx) = self.lookup.get(&(device_id, cache_sector_idx)) {
             // Cache Hit
+            self.stats.hits = self.stats.hits.saturating_add(1);
             let block = &mut self.blocks[idx];
             block.last_access = access_time;
             self.policy.on_access(idx);
@@ -126,17 +153,20 @@ impl BufferCache {
         }
 
         // Cache Miss
+        self.stats.misses = self.stats.misses.saturating_add(1);
         let idx = if let Some(free_idx) = self.free_blocks.pop() {
             free_idx
         } else {
             // Use the replacement policy to select a block to evict
             let lru_idx = self.policy.select_evict(&self.blocks);
+            self.stats.evictions = self.stats.evictions.saturating_add(1);
 
             // TODO: Handle dirty pages (write back before eviction)
             // For now, assume direct write policy so no dirty blocks in cache effectively.
             if self.blocks[lru_idx].state == BlockState::Dirty {
                 // TODO: Initiating write back would be async here...
                 // Ideally return a flag saying "Needs Flush"
+                self.stats.dirty_evictions = self.stats.dirty_evictions.saturating_add(1);
             }
 
             // Remove old mapping
@@ -168,12 +198,14 @@ impl BufferCache {
     pub fn mark_valid(&mut self, idx: usize) {
         if idx < self.blocks.len() {
             self.blocks[idx].state = BlockState::Valid;
+            self.stats.mark_valid_calls = self.stats.mark_valid_calls.saturating_add(1);
         }
     }
 
     pub fn mark_dirty(&mut self, idx: usize) {
         if idx < self.blocks.len() {
             self.blocks[idx].state = BlockState::Dirty;
+            self.stats.mark_dirty_calls = self.stats.mark_dirty_calls.saturating_add(1);
         }
     }
 
@@ -185,6 +217,31 @@ impl BufferCache {
             // If explicit invalidation:
             // self.lookup.remove ...
             // self.free_blocks.push ...
+        }
+    }
+
+    pub fn ledger_snapshot(&self) -> CacheLedgerSnapshot {
+        let mut valid_blocks = 0usize;
+        let mut dirty_blocks = 0usize;
+        for block in &self.blocks {
+            match block.state {
+                BlockState::Valid => valid_blocks = valid_blocks.saturating_add(1),
+                BlockState::Dirty => dirty_blocks = dirty_blocks.saturating_add(1),
+                _ => {}
+            }
+        }
+
+        CacheLedgerSnapshot {
+            hits: self.stats.hits,
+            misses: self.stats.misses,
+            evictions: self.stats.evictions,
+            dirty_evictions: self.stats.dirty_evictions,
+            mark_valid_calls: self.stats.mark_valid_calls,
+            mark_dirty_calls: self.stats.mark_dirty_calls,
+            lookup_entries: self.lookup.len(),
+            free_blocks: self.free_blocks.len(),
+            valid_blocks,
+            dirty_blocks,
         }
     }
 }

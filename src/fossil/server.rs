@@ -80,6 +80,7 @@ impl<'a> SystemService for FossilServer<'a> {
             .ok();
 
         self.init_client.report_service(Badge::null(), ServiceState::Running)?;
+        self.log_resource_ledger("init");
 
         Ok(())
     }
@@ -135,6 +136,7 @@ impl<'a> SystemService for FossilServer<'a> {
                 }
             }
         }
+        self.log_resource_ledger("run_exit");
         Ok(())
     }
 
@@ -249,5 +251,6 @@ impl<'a> SystemService for FossilServer<'a> {
 
     fn stop(&mut self) {
         self.ipc.running = false;
+        self.log_resource_ledger("stop");
     }
 }
