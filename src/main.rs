@@ -50,17 +50,6 @@ fn main() {
         .expect("Fossil: Failed to get device endpoint cap");
     let mut dev_client = DeviceClient::new(DEVICE_CAP);
 
-    // Register Fossil as VolumeService Provider
-    log!("Registering Fossil Volume Service...");
-    res_client
-        .register_cap(
-            Badge::null(),
-            ResourceType::Endpoint,
-            glenda::protocol::resource::VOLUME_ENDPOINT,
-            ENDPOINT_SLOT,
-        )
-        .ok();
-
     log!("Starting server loop...");
     let mut server = FossilServer::new(
         ep,
