@@ -38,7 +38,7 @@ fn main() {
         .expect("Fossil: Failed to get init endpoint cap");
     let mut init_client = InitClient::new(INIT_CAP);
     let mut cspace = CSpaceManager::new(CSPACE_CAP, 16);
-    let mut vspace = VSpaceManager::new(glenda::cap::VSPACE_CAP, 0x7000_0000, 0x8000_0000);
+    let mut vspace = VSpaceManager::new(glenda::cap::VSPACE_CAP, 0x7000_0000, 0x1000_0000);
 
     res_client
         .alloc(Badge::null(), CapType::Endpoint, 0, ENDPOINT_SLOT)

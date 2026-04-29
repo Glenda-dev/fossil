@@ -59,15 +59,6 @@ impl<'a> SystemService for FossilServer<'a> {
 
         self.global_shm = Some(shm);
 
-        // One-shot initial scan/probe for existing devices before reporting Running.
-        self.sync_devices()?;
-        self.process_pending_probes()?;
-
-        // Register hook for future devices (hotplug after initial one-shot scan)
-        log!("Hooked to Unicorn for block devices");
-        let target = HookTarget::Type(LogicDeviceType::Block);
-        self.device_client.hook(Badge::null(), target, self.ipc.endpoint.cap())?;
-
         // Register Volume endpoint with Warren
         log!("Registering Volume Service...");
         self.res_client
@@ -78,6 +69,15 @@ impl<'a> SystemService for FossilServer<'a> {
                 self.ipc.endpoint.cap(),
             )
             .ok();
+
+        // One-shot initial scan/probe for existing devices before reporting Running.
+        self.sync_devices()?;
+        self.process_pending_probes()?;
+
+        // Register hook for future devices (hotplug after initial one-shot scan)
+        log!("Hooked to Unicorn for block devices");
+        let target = HookTarget::Type(LogicDeviceType::Block);
+        self.device_client.hook(Badge::null(), target, self.ipc.endpoint.cap())?;
 
         self.init_client.report_service(Badge::null(), ServiceState::Running)?;
         self.log_resource_ledger("init");
